@@ -3,13 +3,14 @@
 #include <string>
 #include <thread>
 #include <cuda_runtime.h>
+
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
 #include <pcl/visualization/pcl_visualizer.h>
 #include <pcl/io/pcd_io.h>
 #include <opencv2/opencv.hpp>
 
-// Force 16-byte alignment on Host to match GPU
+// Host Struct
 struct alignas(16) SimplePoint {
     float x, y, z;
     union {
@@ -18,85 +19,73 @@ struct alignas(16) SimplePoint {
     };
 };
 
+// CUDA Wrappers
 extern "C" void cuda_compute_cloud(
-    const unsigned short* d_depth, 
-    const unsigned char* d_rgb, 
-    void* d_cloud, 
-    int width, int height, 
-    float fx, float fy, float cx, float cy);
+    const unsigned short* d_depth, const unsigned char* d_rgb, void* d_cloud, 
+    int width, int height, float fx, float fy, float cx, float cy);
+
+extern "C" void cuda_compute_normals(
+    const void* d_cloud, float4* d_normals, int width, int height);
 
 int main(int argc, char** argv) {
-    // 1. Argument Parsing
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <rgb_image> <depth_image> [-v]" << std::endl;
-        std::cerr << "Options:" << std::endl;
-        std::cerr << "  -v   Enable visualization" << std::endl;
         return -1;
     }
+    
+    // --- 1. Load & Prep Images ---
+    cv::Mat rgb_img = cv::imread(argv[1], cv::IMREAD_COLOR);
+    cv::Mat depth_img = cv::imread(argv[2], cv::IMREAD_UNCHANGED);
+    bool visualize = (argc > 3 && std::string(argv[3]) == "-v");
 
-    std::string rgb_path = argv[1];
-    std::string depth_path = argv[2];
-    bool visualize = false;
+    if (rgb_img.empty() || depth_img.empty()) return -1;
+    if (depth_img.size() != rgb_img.size()) cv::resize(depth_img, depth_img, rgb_img.size(), 0, 0, cv::INTER_NEAREST);
+    
+    cv::Mat rgb_conv;
+    cv::cvtColor(rgb_img, rgb_conv, cv::COLOR_BGR2RGB);
 
-    // Check for optional flags starting from the 3rd argument
-    for (int i = 3; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "-v" || arg == "--viz") {
-            visualize = true;
-        }
-    }
-
-    // 2. Load Images
-    cv::Mat rgb_img = cv::imread(rgb_path, cv::IMREAD_COLOR);
-    cv::Mat depth_img = cv::imread(depth_path, cv::IMREAD_UNCHANGED);
-
-    if (rgb_img.empty() || depth_img.empty()) {
-        std::cerr << "Error: Could not load images." << std::endl;
-        return -1;
-    }
-
-    // 3. Pre-process (Resize & Convert)
-    if (depth_img.size() != rgb_img.size()) {
-        cv::resize(depth_img, depth_img, rgb_img.size(), 0, 0, cv::INTER_NEAREST);
-    }
-
-    cv::Mat rgb_converted;
-    cv::cvtColor(rgb_img, rgb_converted, cv::COLOR_BGR2RGB);
-
-    // Force continuous memory
     if (!depth_img.isContinuous()) depth_img = depth_img.clone();
-    if (!rgb_converted.isContinuous()) rgb_converted = rgb_converted.clone();
+    if (!rgb_conv.isContinuous()) rgb_conv = rgb_conv.clone();
 
-    int width = rgb_converted.cols;
-    int height = rgb_converted.rows;
+    int width = rgb_conv.cols;
+    int height = rgb_conv.rows;
     size_t num_pixels = width * height;
 
-    // 4. Intrinsics
     float fx = 525.0f * (width / 640.0f);
     float fy = 525.0f * (height / 480.0f);
     float cx = width / 2.0f;
     float cy = height / 2.0f;
 
-    // 5. GPU Allocation & Compute
+    // --- 2. GPU Allocation ---
     unsigned short *d_depth;
     unsigned char *d_rgb;
     SimplePoint *d_cloud;
+    float4 *d_normals; // Buffer for Normals
 
     cudaMalloc(&d_depth, num_pixels * sizeof(unsigned short));
     cudaMalloc(&d_rgb, num_pixels * 3 * sizeof(unsigned char));
     cudaMalloc(&d_cloud, num_pixels * sizeof(SimplePoint));
+    cudaMalloc(&d_normals, num_pixels * sizeof(float4)); // Allocate for normals
 
+    // --- 3. Upload & Compute ---
     cudaMemcpy(d_depth, depth_img.data, num_pixels * sizeof(unsigned short), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_rgb, rgb_converted.data, num_pixels * 3 * sizeof(unsigned char), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_rgb, rgb_conv.data, num_pixels * 3 * sizeof(unsigned char), cudaMemcpyHostToDevice);
 
+    // Step A: Compute Points
     cuda_compute_cloud(d_depth, d_rgb, (void*)d_cloud, width, height, fx, fy, cx, cy);
+    
+    // Step B: Compute Normals (Using the points on GPU)
+    cuda_compute_normals((void*)d_cloud, d_normals, width, height);
 
-    // 6. Download Results
-    std::vector<SimplePoint> host_buffer(num_pixels);
-    cudaMemcpy(host_buffer.data(), d_cloud, num_pixels * sizeof(SimplePoint), cudaMemcpyDeviceToHost);
+    // --- 4. Download ---
+    std::vector<SimplePoint> h_points(num_pixels);
+    std::vector<float4> h_normals(num_pixels);
 
-    // Convert to PCL Cloud
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+    cudaMemcpy(h_points.data(), d_cloud, num_pixels * sizeof(SimplePoint), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_normals.data(), d_normals, num_pixels * sizeof(float4), cudaMemcpyDeviceToHost);
+
+    // --- 5. Convert to PCL & Save ---
+    pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZRGBNormal>);
     cloud->width = width;
     cloud->height = height;
     cloud->is_dense = false;
@@ -104,25 +93,32 @@ int main(int argc, char** argv) {
 
     #pragma omp parallel for
     for (size_t i = 0; i < num_pixels; ++i) {
-        cloud->points[i].x = host_buffer[i].x;
-        cloud->points[i].y = host_buffer[i].y;
-        cloud->points[i].z = host_buffer[i].z;
-        cloud->points[i].rgb = host_buffer[i].rgb;
+        // Point
+        cloud->points[i].x = h_points[i].x;
+        cloud->points[i].y = h_points[i].y;
+        cloud->points[i].z = h_points[i].z;
+        cloud->points[i].rgb = h_points[i].rgb;
+        
+        // Normal
+        cloud->points[i].normal_x = h_normals[i].x;
+        cloud->points[i].normal_y = h_normals[i].y;
+        cloud->points[i].normal_z = h_normals[i].z;
+        cloud->points[i].curvature = 0;
     }
 
-    // Save File
-    pcl::io::savePCDFileBinary("output_gpu.pcd", *cloud);
-    std::cout << "Saved cloud to output_gpu.pcd (" << num_pixels << " points)" << std::endl;
+    pcl::io::savePCDFileBinary("output_with_normals.pcd", *cloud);
+    std::cout << "Saved 'output_with_normals.pcd'" << std::endl;
 
-    // 7. Optional Visualization
+    // --- 6. Visualize ---
     if (visualize) {
-        std::cout << "Opening Viewer..." << std::endl;
         pcl::visualization::PCLVisualizer::Ptr viewer(new pcl::visualization::PCLVisualizer("3D Viewer"));
         viewer->setBackgroundColor(0.1, 0.1, 0.1);
-        pcl::visualization::PointCloudColorHandlerRGBField<pcl::PointXYZRGB> rgb(cloud);
         
-        viewer->addPointCloud<pcl::PointXYZRGB>(cloud, rgb, "cloud");
-        viewer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 2, "cloud");
+        // Add cloud with Normals
+        // Level=10 (show every 10th normal), Scale=0.05
+        pcl::visualization::PointCloudColorHandlerRGBField<pcl::PointXYZRGBNormal> rgb(cloud);
+        viewer->addPointCloud<pcl::PointXYZRGBNormal>(cloud, rgb, "cloud");
+        viewer->addPointCloudNormals<pcl::PointXYZRGBNormal>(cloud, 10, 0.05, "normals");
         
         viewer->addCoordinateSystem(0.5); 
         viewer->initCameraParameters();
@@ -134,9 +130,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    cudaFree(d_depth);
-    cudaFree(d_rgb);
-    cudaFree(d_cloud);
-
+    cudaFree(d_depth); cudaFree(d_rgb); cudaFree(d_cloud); cudaFree(d_normals);
     return 0;
 }
