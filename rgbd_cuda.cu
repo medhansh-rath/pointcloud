@@ -147,7 +147,48 @@ __global__ void computeNormalsKernel(
     }
 }
 
-// 4. The Wrapper Functions (Callable from C++)
+// 4. The Kernel for Reprojecting to Image
+__global__ void reprojectToImageKernel(
+    const PointXYZRGB* __restrict__ cloud,
+    const float4* __restrict__ normals,
+    float* __restrict__ image,  // size height * width * 7: R, G, B, depth, nx, ny, nz
+    int width, int height)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (u >= width || v >= height) return;
+
+    int idx = v * width + u;
+    int img_idx = idx * 7;
+
+    PointXYZRGB p = cloud[idx];
+    float4 n = normals[idx];
+
+    // Check if point is valid
+    if (isnan(p.z) || p.z == 0.0f) {
+        // Set to zeros or NaN
+        for (int i = 0; i < 7; ++i) {
+            image[img_idx + i] = 0.0f;
+        }
+        return;
+    }
+
+    // R, G, B (normalized to 0-1)
+    image[img_idx + 0] = p.r / 255.0f;
+    image[img_idx + 1] = p.g / 255.0f;
+    image[img_idx + 2] = p.b / 255.0f;
+
+    // Depth (z in meters)
+    image[img_idx + 3] = p.z;
+
+    // Normal x, y, z
+    image[img_idx + 4] = n.x;
+    image[img_idx + 5] = n.y;
+    image[img_idx + 6] = n.z;
+}
+
+// 5. The Wrapper Functions (Callable from C++)
 
 extern "C" void cuda_compute_cloud(
     const unsigned short* d_depth, 
@@ -173,6 +214,20 @@ extern "C" void cuda_compute_normals(
     dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
 
     computeNormalsKernel<<<grid, block>>>(d_cloud, d_normals, width, height);
+
+    cudaDeviceSynchronize();
+}
+
+extern "C" void cuda_reproject_to_image(
+    const PointXYZRGB* d_cloud,
+    const float4* d_normals,
+    float* d_image,
+    int width, int height)
+{
+    dim3 block(32, 32);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+
+    reprojectToImageKernel<<<grid, block>>>(d_cloud, d_normals, d_image, width, height);
 
     cudaDeviceSynchronize();
 }

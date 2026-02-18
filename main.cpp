@@ -2,6 +2,7 @@
 #include <vector>
 #include <string>
 #include <thread>
+#include <fstream>
 #include <cuda_runtime.h>
 
 #include <pcl/point_types.h>
@@ -29,6 +30,12 @@ extern "C" void cuda_compute_cloud(
 extern "C" void cuda_compute_normals(
     const PointXYZRGB* d_cloud, 
     float4* d_normals, 
+    int width, int height);
+
+extern "C" void cuda_reproject_to_image(
+    const PointXYZRGB* d_cloud,
+    const float4* d_normals,
+    float* d_image,
     int width, int height);
 
 int main(int argc, char** argv) {
@@ -87,6 +94,7 @@ int main(int argc, char** argv) {
     unsigned char *d_rgb;
     PointXYZRGB *d_cloud;
     float4 *d_normals = nullptr; // Initialize to nullptr
+    float *d_image = nullptr;    // For reprojected image
 
     cudaMalloc(&d_depth, num_pixels * sizeof(unsigned short));
     cudaMalloc(&d_rgb, num_pixels * 3 * sizeof(unsigned char));
@@ -95,6 +103,7 @@ int main(int argc, char** argv) {
     // ONLY allocate memory for normals if the flag is set
     if (use_normals) {
         cudaMalloc(&d_normals, num_pixels * sizeof(float4));
+        cudaMalloc(&d_image, num_pixels * 7 * sizeof(float));  // 7 channels
     }
 
     // 4. Upload & Compute
@@ -107,6 +116,9 @@ int main(int argc, char** argv) {
     // Compute Normals (Optional)
     if (use_normals) {
         cuda_compute_normals(d_cloud, d_normals, width, height);
+        
+        // Reproject to image
+        cuda_reproject_to_image(d_cloud, d_normals, d_image, width, height);
     }
 
     // 5. Download Results
@@ -118,6 +130,23 @@ int main(int argc, char** argv) {
     if (use_normals) {
         h_normals.resize(num_pixels);
         cudaMemcpy(h_normals.data(), d_normals, num_pixels * sizeof(float4), cudaMemcpyDeviceToHost);
+    }
+
+    // Download reprojected image
+    std::vector<float> h_image;
+    if (use_normals) {
+        h_image.resize(num_pixels * 7);
+        cudaMemcpy(h_image.data(), d_image, num_pixels * 7 * sizeof(float), cudaMemcpyDeviceToHost);
+        
+        // Save to binary file
+        std::ofstream outfile("reprojected_image.bin", std::ios::binary);
+        if (outfile.is_open()) {
+            outfile.write(reinterpret_cast<char*>(h_image.data()), h_image.size() * sizeof(float));
+            outfile.close();
+            std::cout << "Saved reprojected image to 'reprojected_image.bin'" << std::endl;
+        } else {
+            std::cerr << "Error: Could not open file for writing." << std::endl;
+        }
     }
 
     // 6. Convert to PCL & Save
@@ -181,6 +210,7 @@ int main(int argc, char** argv) {
     cudaFree(d_rgb);
     cudaFree(d_cloud);
     if (d_normals) cudaFree(d_normals); // Safety check
+    if (d_image) cudaFree(d_image);
 
     return 0;
 }
