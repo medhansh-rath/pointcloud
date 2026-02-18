@@ -1,3 +1,0 @@
-/home/medhansh/pointcloud/build/CMakeFiles/fast_cloud.dir
-/home/medhansh/pointcloud/build/CMakeFiles/edit_cache.dir
-/home/medhansh/pointcloud/build/CMakeFiles/rebuild_cache.dir
