@@ -403,6 +403,136 @@ extern "C" void cuda_fill_depth_jfa(
     cudaFree(d_temp);
 }
 
+// 6c. CUDA Kernel for Depth Hole Filling (Median)
+__global__ void fillDepthHolesMedianKernel(
+    unsigned short* depth_map,
+    int width, int height,
+    int max_radius)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (u >= width || v >= height) return;
+
+    int idx = v * width + u;
+    if (depth_map[idx] != 0) return; // Only process holes
+
+    const int MAX_NEIGHBORS = 512; // Fixed size for neighbors
+    unsigned short neighbors[MAX_NEIGHBORS];
+
+    for (int radius = 1; radius <= max_radius; ++radius) {
+        // Collect neighbor depths
+        unsigned int count = 0;
+
+        for (int du = -radius; du <= radius && count < MAX_NEIGHBORS; ++du) {
+            for (int dv = -radius; dv <= radius && count < MAX_NEIGHBORS; ++dv) {
+                int nu = u + du;
+                int nv = v + dv;
+                if (nu < 0 || nu >= width || nv < 0 || nv >= height) continue;
+                int nidx = nv * width + nu;
+                unsigned short neighbor_depth = depth_map[nidx];
+                if (neighbor_depth != 0) {
+                    neighbors[count++] = neighbor_depth;
+                }
+            }
+        }
+
+        if (count > 0) {
+            // Simple bubble sort (not efficient, but works for small arrays)
+            for (unsigned int i = 0; i < count - 1; ++i) {
+                for (unsigned int j = i + 1; j < count; ++j) {
+                    if (neighbors[i] > neighbors[j]) {
+                        unsigned short tmp = neighbors[i];
+                        neighbors[i] = neighbors[j];
+                        neighbors[j] = tmp;
+                    }
+                }
+            }
+            // Median is middle value (or average of two middle for even count)
+            depth_map[idx] = (count % 2 == 1) ? neighbors[count / 2] : (neighbors[count / 2 - 1] + neighbors[count / 2]) / 2;
+            break;
+        }
+    }
+}
+
+extern "C" void cuda_fill_depth_holes_median(
+    unsigned short* d_depth,
+    int width, int height,
+    int max_radius)
+{
+    dim3 block(32, 32);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    fillDepthHolesMedianKernel<<<grid, block>>>(d_depth, width, height, max_radius);
+    cudaDeviceSynchronize();
+}
+
+// 6d. CUDA Kernel for Depth Hole Filling (Mode)
+__global__ void fillDepthHolesModeKernel(
+    unsigned short* depth_map,
+    int width, int height,
+    int max_radius)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (u >= width || v >= height) return;
+
+    int idx = v * width + u;
+    if (depth_map[idx] != 0) return; // Only process holes
+
+    const int MAX_NEIGHBORS = 512; // Fixed size for neighbors
+    unsigned short neighbors[MAX_NEIGHBORS];
+
+    for (int radius = 1; radius <= max_radius; ++radius) {
+        // Collect neighbor depths
+        unsigned int count = 0;
+
+        for (int du = -radius; du <= radius && count < MAX_NEIGHBORS; ++du) {
+            for (int dv = -radius; dv <= radius && count < MAX_NEIGHBORS; ++dv) {
+                int nu = u + du;
+                int nv = v + dv;
+                if (nu < 0 || nu >= width || nv < 0 || nv >= height) continue;
+                int nidx = nv * width + nu;
+                unsigned short neighbor_depth = depth_map[nidx];
+                if (neighbor_depth != 0) {
+                    neighbors[count++] = neighbor_depth;
+                }
+            }
+        }
+
+        if (count > 0) {
+            // Find mode (most frequent value)
+            unsigned short mode = neighbors[0];
+            unsigned int max_freq = 1;
+            
+            // Count frequencies (brute force for small arrays)
+            for (unsigned int i = 0; i < count; ++i) {
+                unsigned int freq = 0;
+                for (unsigned int j = 0; j < count; ++j) {
+                    if (neighbors[i] == neighbors[j]) freq++;
+                }
+                if (freq > max_freq) {
+                    max_freq = freq;
+                    mode = neighbors[i];
+                }
+            }
+            depth_map[idx] = mode;
+            break;
+        }
+    }
+}
+
+extern "C" void cuda_fill_depth_holes_mode(
+    unsigned short* d_depth,
+    int width, int height,
+    int max_radius)
+{
+    dim3 block(32, 32);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    fillDepthHolesModeKernel<<<grid, block>>>(d_depth, width, height, max_radius);
+    cudaDeviceSynchronize();
+}
+
 // 7. The Wrapper Functions (Callable from C++)
 
 extern "C" void cuda_compute_cloud(
