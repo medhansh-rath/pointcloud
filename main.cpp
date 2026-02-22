@@ -113,6 +113,7 @@ int main(int argc, char** argv) {
         std::cerr << "  -g   Save filled depth image (Guided Filter)" << std::endl;
         std::cerr << "  -G   Save filled depth image (True Guided Filter)" << std::endl;
         std::cerr << "  -x   Save filled depth image (Maximum Filter)" << std::endl;
+        std::cerr << "  -d   Save RGB+depth overlay image" << std::endl;
         std::cerr << "  --fill-radius <r>   Set max fill radius (default 10)" << std::endl;
         std::cerr << "  --blob-iters <i>   Set max blob iterations (default 10)" << std::endl;
         std::cerr << "  --guided-radius <r>   Set guided filter radius (default 2)" << std::endl;
@@ -139,6 +140,7 @@ int main(int argc, char** argv) {
     bool save_filled_depth_guided = false;
     bool save_filled_depth_true_guided = false;
     bool save_filled_depth_max = false;
+    bool save_depth_overlay = false;
     int fill_radius = 10;
     int blob_iters = 10;
     int guided_filter_radius = 2;
@@ -162,6 +164,7 @@ int main(int argc, char** argv) {
         if (arg == "-g" || arg == "--save-depth-guided") save_filled_depth_guided = true;
         if (arg == "-G" || arg == "--save-depth-true-guided") save_filled_depth_true_guided = true;
         if (arg == "-x" || arg == "--save-depth-max") save_filled_depth_max = true;
+        if (arg == "-d" || arg == "--save-depth-overlay") save_depth_overlay = true;
         if (arg == "--fill-radius" && i + 1 < argc) {
             fill_radius = std::stoi(argv[++i]);
         }
@@ -207,6 +210,26 @@ int main(int argc, char** argv) {
     // Force continuous memory
     if (!depth_img.isContinuous()) depth_img = depth_img.clone();
     if (!rgb_conv.isContinuous()) rgb_conv = rgb_conv.clone();
+    if (save_depth_overlay) {
+        cv::Mat depth_mask = depth_img > 0;
+        double min_val = 0.0;
+        double max_val = 0.0;
+        if (cv::countNonZero(depth_mask) > 0) {
+            cv::minMaxLoc(depth_img, &min_val, &max_val, nullptr, nullptr, depth_mask);
+        }
+        cv::Mat depth_norm;
+        if (max_val > min_val) {
+            depth_img.convertTo(depth_norm, CV_8U, 255.0 / (max_val - min_val), -min_val * 255.0 / (max_val - min_val));
+        } else {
+            depth_norm = cv::Mat::zeros(depth_img.size(), CV_8U);
+        }
+        cv::Mat depth_color;
+        cv::applyColorMap(depth_norm, depth_color, cv::COLORMAP_JET);
+        cv::Mat overlay;
+        cv::addWeighted(rgb_img, 0.6, depth_color, 0.4, 0.0, overlay);
+        cv::imwrite("overlay_depth_rgb.png", overlay);
+        std::cout << "Saved depth overlay image to 'overlay_depth_rgb.png'" << std::endl;
+    }
     auto t_preproc_end = std::chrono::high_resolution_clock::now();
     if (show_timers) std::cout << "Image preprocessing time: " << std::chrono::duration<double, std::milli>(t_preproc_end - t_preproc_start).count() << " ms" << std::endl;
 
