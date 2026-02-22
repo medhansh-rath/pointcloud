@@ -288,7 +288,122 @@ extern "C" void cuda_fill_depth_holes_avg(
     cudaDeviceSynchronize();
 }
 
-// 5. The Wrapper Functions (Callable from C++)
+// 6. CUDA Kernel for Blob-Based Hole Filling
+__global__ void fillDepthBlobsKernel(
+    unsigned short* depth_map,
+    int width, int height,
+    int max_iters)
+{
+    // Each thread processes one pixel
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+
+    // Temporary label image (1 = blob, 0 = not blob)
+    // For simplicity, use depth_map == 0 as blob
+    // This kernel assumes blobs are not overlapping and does not handle multiple blobs in parallel
+
+    // Iterative flood fill: propagate labels
+    for (int iter = 0; iter < max_iters; ++iter) {
+        if (depth_map[idx] != 0) continue;
+        // If any neighbor is labeled as filled, skip
+        bool is_boundary = false;
+        unsigned int sum = 0;
+        unsigned int count = 0;
+        for (int du = -1; du <= 1; ++du) {
+            for (int dv = -1; dv <= 1; ++dv) {
+                if (du == 0 && dv == 0) continue;
+                int nu = u + du;
+                int nv = v + dv;
+                if (nu < 0 || nu >= width || nv < 0 || nv >= height) continue;
+                int nidx = nv * width + nu;
+                unsigned short neighbor_depth = depth_map[nidx];
+                if (neighbor_depth != 0) {
+                    is_boundary = true;
+                    sum += neighbor_depth;
+                    count++;
+                }
+            }
+        }
+        // If boundary, fill with average
+        if (is_boundary && count > 0) {
+            depth_map[idx] = sum / count;
+        }
+    }
+}
+
+extern "C" void cuda_fill_depth_blobs(
+    unsigned short* d_depth,
+    int width, int height,
+    int max_iters)
+{
+    dim3 block(32, 32);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    fillDepthBlobsKernel<<<grid, block>>>(d_depth, width, height, max_iters);
+    cudaDeviceSynchronize();
+}
+
+// 6b. CUDA Kernel for Jump Flooding Algorithm (JFA) Blob Filling
+__global__ void jumpFloodFillKernel(
+    unsigned short* depth_map,
+    unsigned short* temp_map,
+    int width, int height,
+    int jump)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+
+    // If already filled, propagate value
+    if (depth_map[idx] != 0) {
+        temp_map[idx] = depth_map[idx];
+        return;
+    }
+
+    unsigned short best_depth = 0;
+    // Check 8 directions at distance 'jump'
+    for (int du = -1; du <= 1; ++du) {
+        for (int dv = -1; dv <= 1; ++dv) {
+            if (du == 0 && dv == 0) continue;
+            int nu = u + du * jump;
+            int nv = v + dv * jump;
+            if (nu < 0 || nu >= width || nv < 0 || nv >= height) continue;
+            int nidx = nv * width + nu;
+            unsigned short neighbor_depth = depth_map[nidx];
+            if (neighbor_depth != 0) {
+                best_depth = neighbor_depth;
+                break;
+            }
+        }
+        if (best_depth != 0) break;
+    }
+    temp_map[idx] = best_depth;
+}
+
+extern "C" void cuda_fill_depth_jfa(
+    unsigned short* d_depth,
+    int width, int height)
+{
+    // Allocate temporary buffer
+    unsigned short* d_temp;
+    cudaMalloc(&d_temp, width * height * sizeof(unsigned short));
+
+    dim3 block(32, 32);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+
+    int max_jump = max(width, height) / 2;
+    for (int jump = max_jump; jump >= 1; jump /= 2) {
+        jumpFloodFillKernel<<<grid, block>>>(d_depth, d_temp, width, height, jump);
+        cudaDeviceSynchronize();
+        // Copy temp_map back to depth_map for next iteration
+        cudaMemcpy(d_depth, d_temp, width * height * sizeof(unsigned short), cudaMemcpyDeviceToDevice);
+    }
+    cudaFree(d_temp);
+}
+
+// 7. The Wrapper Functions (Callable from C++)
 
 extern "C" void cuda_compute_cloud(
     const unsigned short* d_depth, 

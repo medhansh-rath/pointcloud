@@ -48,6 +48,15 @@ extern "C" void cuda_fill_depth_holes_avg(
     int width, int height,
     int max_radius);
 
+extern "C" void cuda_fill_depth_blobs(
+    unsigned short* d_depth,
+    int width, int height,
+    int max_iters);
+
+extern "C" void cuda_fill_depth_jfa(
+    unsigned short* d_depth,
+    int width, int height);
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <rgb_image> <depth_image> [options]" << std::endl;
@@ -56,7 +65,10 @@ int main(int argc, char** argv) {
         std::cerr << "  -v   Visualize result" << std::endl;
         std::cerr << "  -s   Save filled depth image (nearest)" << std::endl;
         std::cerr << "  -a   Save filled depth image (average)" << std::endl;
+        std::cerr << "  -b   Save filled depth image (blob-based)" << std::endl;
+        std::cerr << "  -j   Save filled depth image (jump flooding)" << std::endl;
         std::cerr << "  --fill-radius <r>   Set max fill radius (default 10)" << std::endl;
+        std::cerr << "  --blob-iters <i>   Set max blob iterations (default 10)" << std::endl;
         return -1;
     }
 
@@ -67,7 +79,10 @@ int main(int argc, char** argv) {
     bool visualize = false;
     bool save_filled_depth_nearest = false;
     bool save_filled_depth_avg = false;
+    bool save_filled_depth_blob = false;
+    bool save_filled_depth_jfa = false;
     int fill_radius = 10;
+    int blob_iters = 10;
 
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
@@ -75,8 +90,13 @@ int main(int argc, char** argv) {
         if (arg == "-v" || arg == "--viz") visualize = true;
         if (arg == "-s" || arg == "--save-depth") save_filled_depth_nearest = true;
         if (arg == "-a" || arg == "--save-depth-avg") save_filled_depth_avg = true;
+        if (arg == "-b" || arg == "--save-depth-blob") save_filled_depth_blob = true;
+        if (arg == "-j" || arg == "--save-depth-jfa") save_filled_depth_jfa = true;
         if (arg == "--fill-radius" && i + 1 < argc) {
             fill_radius = std::stoi(argv[++i]);
+        }
+        if (arg == "--blob-iters" && i + 1 < argc) {
+            blob_iters = std::stoi(argv[++i]);
         }
     }
 
@@ -147,6 +167,22 @@ int main(int argc, char** argv) {
         cv::Mat filled_depth_img(height, width, CV_16UC1, h_filled_depth.data());
         cv::imwrite("filled_depth_avg.png", filled_depth_img);
         std::cout << "Saved filled depth image to 'filled_depth_avg.png'" << std::endl;
+    }
+    if (save_filled_depth_blob) {
+        cuda_fill_depth_blobs(d_depth, width, height, blob_iters);
+        std::vector<unsigned short> h_filled_depth(num_pixels);
+        cudaMemcpy(h_filled_depth.data(), d_depth, num_pixels * sizeof(unsigned short), cudaMemcpyDeviceToHost);
+        cv::Mat filled_depth_img(height, width, CV_16UC1, h_filled_depth.data());
+        cv::imwrite("filled_depth_blob.png", filled_depth_img);
+        std::cout << "Saved filled depth image to 'filled_depth_blob.png'" << std::endl;
+    }
+    if (save_filled_depth_jfa) {
+        cuda_fill_depth_jfa(d_depth, width, height);
+        std::vector<unsigned short> h_filled_depth(num_pixels);
+        cudaMemcpy(h_filled_depth.data(), d_depth, num_pixels * sizeof(unsigned short), cudaMemcpyDeviceToHost);
+        cv::Mat filled_depth_img(height, width, CV_16UC1, h_filled_depth.data());
+        cv::imwrite("filled_depth_jfa.png", filled_depth_img);
+        std::cout << "Saved filled depth image to 'filled_depth_jfa.png'" << std::endl;
     }
 
     // Compute Points
