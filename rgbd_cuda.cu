@@ -644,6 +644,111 @@ extern "C" void cuda_fill_depth_holes_ip_basic(
     cudaFree(d_depth_temp);
 }
 
+// 6f. CUDA Kernel for Fast Guided Filter (RGB-guided depth inpainting)
+// Uses RGB image to guide depth filling while preserving sharp edges
+__global__ void fillDepthGuidedFilterKernel(
+    const unsigned short* __restrict__ depth_in,
+    const unsigned char* __restrict__ rgb,
+    unsigned short* __restrict__ depth_out,
+    int width, int height,
+    int filter_radius,
+    float color_sigma)  // Color difference threshold
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+
+    // If already filled, copy it
+    if (depth_in[idx] != 0) {
+        depth_out[idx] = depth_in[idx];
+        return;
+    }
+
+    // Get RGB of current pixel
+    int rgb_idx = idx * 3;
+    unsigned char r_center = rgb[rgb_idx];
+    unsigned char g_center = rgb[rgb_idx + 1];
+    unsigned char b_center = rgb[rgb_idx + 2];
+
+    // Collect valid neighbors weighted by color similarity
+    float weighted_sum = 0.0f;
+    float total_weight = 0.0f;
+
+    for (int du = -filter_radius; du <= filter_radius; ++du) {
+        for (int dv = -filter_radius; dv <= filter_radius; ++dv) {
+            int nu = u + du;
+            int nv = v + dv;
+            if (nu < 0 || nu >= width || nv < 0 || nv >= height) continue;
+            int nidx = nv * width + nu;
+
+            unsigned short neighbor_depth = depth_in[nidx];
+            if (neighbor_depth == 0) continue;  // Skip unfilled pixels
+
+            // Get RGB of neighbor
+            int n_rgb_idx = nidx * 3;
+            unsigned char r_n = rgb[n_rgb_idx];
+            unsigned char g_n = rgb[n_rgb_idx + 1];
+            unsigned char b_n = rgb[n_rgb_idx + 2];
+
+            // Compute color distance
+            float dr = (float)(r_center - r_n);
+            float dg = (float)(g_center - g_n);
+            float db = (float)(b_center - b_n);
+            float color_dist = sqrtf(dr*dr + dg*dg + db*db);
+
+            // Spatial distance
+            float spatial_dist = sqrtf((float)(du*du + dv*dv));
+
+            // Weight: Gaussian in both color and spatial domains
+            // High weight if color is similar AND spatially close
+            float color_weight = expf(-(color_dist * color_dist) / (2.0f * color_sigma * color_sigma));
+            float spatial_weight = expf(-(spatial_dist * spatial_dist) / 2.0f);  // sigma=1.0 for spatial
+            float weight = color_weight * spatial_weight;
+
+            weighted_sum += neighbor_depth * weight;
+            total_weight += weight;
+        }
+    }
+
+    // Fill with weighted average
+    if (total_weight > 0.0f) {
+        depth_out[idx] = (unsigned short)(weighted_sum / total_weight + 0.5f);
+    } else {
+        // No valid neighbors found, keep as hole
+        depth_out[idx] = 0;
+    }
+}
+
+extern "C" void cuda_fill_depth_guided_filter(
+    unsigned short* d_depth,
+    const unsigned char* d_rgb,
+    int width, int height,
+    int filter_radius,
+    int max_iters,
+    float color_sigma)  // Color threshold (0-255 scale, typically 20-50)
+{
+    // Allocate temporary depth buffer
+    unsigned short* d_temp;
+    cudaMalloc(&d_temp, width * height * sizeof(unsigned short));
+
+    dim3 block(32, 32);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+
+    // Iteratively fill holes
+    for (int iter = 0; iter < max_iters; ++iter) {
+        fillDepthGuidedFilterKernel<<<grid, block>>>(
+            d_depth, d_rgb, d_temp, width, height, filter_radius, color_sigma);
+        cudaDeviceSynchronize();
+        
+        // Copy temp back to depth for next iteration
+        cudaMemcpy(d_depth, d_temp, width * height * sizeof(unsigned short), cudaMemcpyDeviceToDevice);
+    }
+
+    cudaFree(d_temp);
+}
+
 // 7. The Wrapper Functions (Callable from C++)
 
 
