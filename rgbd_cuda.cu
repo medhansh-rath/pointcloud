@@ -188,6 +188,106 @@ __global__ void reprojectToImageKernel(
     image[img_idx + 6] = n.z;
 }
 
+// 5. The Kernel for Depth Hole Filling (Nearest)
+__global__ void fillDepthHolesKernel(
+    unsigned short* depth_map,
+    int width, int height,
+    int max_radius)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (u >= width || v >= height) return;
+
+    int idx = v * width + u;
+    if (depth_map[idx] != 0) return; // Only process holes
+
+    for (int radius = 1; radius <= max_radius; ++radius) {
+        bool found = false;
+        unsigned short found_depth = 0;
+        for (int du = -radius; du <= radius; ++du) {
+            for (int dv = -radius; dv <= radius; ++dv) {
+                if (abs(du) != radius && abs(dv) != radius) continue;
+                int nu = u + du;
+                int nv = v + dv;
+                if (nu < 0 || nu >= width || nv < 0 || nv >= height) continue;
+                int nidx = nv * width + nu;
+                unsigned short neighbor_depth = depth_map[nidx];
+                if (neighbor_depth != 0) {
+                    found_depth = neighbor_depth;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) break;
+        }
+        if (found) {
+            depth_map[idx] = found_depth;
+            break;
+        }
+    }
+}
+
+extern "C" void cuda_fill_depth_holes(
+    unsigned short* d_depth,
+    int width, int height,
+    int max_radius)
+{
+    dim3 block(32, 32);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    fillDepthHolesKernel<<<grid, block>>>(d_depth, width, height, max_radius);
+    cudaDeviceSynchronize();
+}
+
+// 5b. The Kernel for Depth Hole Filling (Averaging)
+__global__ void fillDepthHolesAvgKernel(
+    unsigned short* depth_map,
+    int width, int height,
+    int max_radius)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (u >= width || v >= height) return;
+
+    int idx = v * width + u;
+    if (depth_map[idx] != 0) return; // Only process holes
+
+    unsigned int sum = 0;
+    unsigned int count = 0;
+
+    for (int radius = 1; radius <= max_radius; ++radius) {
+        for (int du = -radius; du <= radius; ++du) {
+            for (int dv = -radius; dv <= radius; ++dv) {
+                int nu = u + du;
+                int nv = v + dv;
+                if (nu < 0 || nu >= width || nv < 0 || nv >= height) continue;
+                int nidx = nv * width + nu;
+                unsigned short neighbor_depth = depth_map[nidx];
+                if (neighbor_depth != 0) {
+                    sum += neighbor_depth;
+                    count++;
+                }
+            }
+        }
+        if (count > 0) {
+            depth_map[idx] = sum / count;
+            break;
+        }
+    }
+}
+
+extern "C" void cuda_fill_depth_holes_avg(
+    unsigned short* d_depth,
+    int width, int height,
+    int max_radius)
+{
+    dim3 block(32, 32);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    fillDepthHolesAvgKernel<<<grid, block>>>(d_depth, width, height, max_radius);
+    cudaDeviceSynchronize();
+}
+
 // 5. The Wrapper Functions (Callable from C++)
 
 extern "C" void cuda_compute_cloud(

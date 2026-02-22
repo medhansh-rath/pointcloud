@@ -38,12 +38,25 @@ extern "C" void cuda_reproject_to_image(
     float* d_image,
     int width, int height);
 
+extern "C" void cuda_fill_depth_holes(
+    unsigned short* d_depth,
+    int width, int height,
+    int max_radius);
+
+extern "C" void cuda_fill_depth_holes_avg(
+    unsigned short* d_depth,
+    int width, int height,
+    int max_radius);
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <rgb_image> <depth_image> [options]" << std::endl;
         std::cerr << "Options:" << std::endl;
         std::cerr << "  -n   Compute Surface Normals" << std::endl;
         std::cerr << "  -v   Visualize result" << std::endl;
+        std::cerr << "  -s   Save filled depth image (nearest)" << std::endl;
+        std::cerr << "  -a   Save filled depth image (average)" << std::endl;
+        std::cerr << "  --fill-radius <r>   Set max fill radius (default 10)" << std::endl;
         return -1;
     }
 
@@ -52,11 +65,19 @@ int main(int argc, char** argv) {
     std::string depth_path = argv[2];
     bool use_normals = false;
     bool visualize = false;
+    bool save_filled_depth_nearest = false;
+    bool save_filled_depth_avg = false;
+    int fill_radius = 10;
 
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-n" || arg == "--normals") use_normals = true;
         if (arg == "-v" || arg == "--viz") visualize = true;
+        if (arg == "-s" || arg == "--save-depth") save_filled_depth_nearest = true;
+        if (arg == "-a" || arg == "--save-depth-avg") save_filled_depth_avg = true;
+        if (arg == "--fill-radius" && i + 1 < argc) {
+            fill_radius = std::stoi(argv[++i]);
+        }
     }
 
     // 2. Load & Pre-process Images
@@ -109,6 +130,24 @@ int main(int argc, char** argv) {
     // 4. Upload & Compute
     cudaMemcpy(d_depth, depth_img.data, num_pixels * sizeof(unsigned short), cudaMemcpyHostToDevice);
     cudaMemcpy(d_rgb, rgb_conv.data, num_pixels * 3 * sizeof(unsigned char), cudaMemcpyHostToDevice);
+
+    // Fill holes in depth image (if requested)
+    if (save_filled_depth_nearest) {
+        cuda_fill_depth_holes(d_depth, width, height, fill_radius);
+        std::vector<unsigned short> h_filled_depth(num_pixels);
+        cudaMemcpy(h_filled_depth.data(), d_depth, num_pixels * sizeof(unsigned short), cudaMemcpyDeviceToHost);
+        cv::Mat filled_depth_img(height, width, CV_16UC1, h_filled_depth.data());
+        cv::imwrite("filled_depth_nearest.png", filled_depth_img);
+        std::cout << "Saved filled depth image to 'filled_depth_nearest.png'" << std::endl;
+    }
+    if (save_filled_depth_avg) {
+        cuda_fill_depth_holes_avg(d_depth, width, height, fill_radius);
+        std::vector<unsigned short> h_filled_depth(num_pixels);
+        cudaMemcpy(h_filled_depth.data(), d_depth, num_pixels * sizeof(unsigned short), cudaMemcpyDeviceToHost);
+        cv::Mat filled_depth_img(height, width, CV_16UC1, h_filled_depth.data());
+        cv::imwrite("filled_depth_avg.png", filled_depth_img);
+        std::cout << "Saved filled depth image to 'filled_depth_avg.png'" << std::endl;
+    }
 
     // Compute Points
     cuda_compute_cloud(d_depth, d_rgb, d_cloud, width, height, fx, fy, cx, cy);
