@@ -68,6 +68,11 @@ extern "C" void cuda_fill_depth_holes_mode(
     int width, int height,
     int max_radius);
 
+extern "C" void cuda_fill_depth_holes_ip_basic(
+    unsigned short* d_depth,
+    int width, int height,
+    int max_iters);
+
 int main(int argc, char** argv) {
     auto process_start = std::chrono::high_resolution_clock::now();
     if (argc < 3) {
@@ -83,6 +88,7 @@ int main(int argc, char** argv) {
         std::cerr << "  -j   Save filled depth image (jump flooding)" << std::endl;
         std::cerr << "  -m   Save filled depth image (median)" << std::endl;
         std::cerr << "  -o   Save filled depth image (mode)" << std::endl;
+        std::cerr << "  -c   Save filled depth image (IP-Basic inpainting)" << std::endl;
         std::cerr << "  --fill-radius <r>   Set max fill radius (default 10)" << std::endl;
         std::cerr << "  --blob-iters <i>   Set max blob iterations (default 10)" << std::endl;
         return -1;
@@ -101,6 +107,7 @@ int main(int argc, char** argv) {
     bool save_filled_depth_jfa = false;
     bool save_filled_depth_median = false;
     bool save_filled_depth_mode = false;
+    bool save_filled_depth_ip_basic = false;
     int fill_radius = 10;
     int blob_iters = 10;
 
@@ -116,6 +123,7 @@ int main(int argc, char** argv) {
         if (arg == "-j" || arg == "--save-depth-jfa") save_filled_depth_jfa = true;
         if (arg == "-m" || arg == "--save-depth-median") save_filled_depth_median = true;
         if (arg == "-o" || arg == "--save-depth-mode") save_filled_depth_mode = true;
+        if (arg == "-c" || arg == "--save-depth-ip-basic") save_filled_depth_ip_basic = true;
         if (arg == "--fill-radius" && i + 1 < argc) {
             fill_radius = std::stoi(argv[++i]);
         }
@@ -276,6 +284,19 @@ int main(int argc, char** argv) {
         cv::imwrite("filled_depth_mode.png", filled_depth_img);
         std::cout << "Saved filled depth image to 'filled_depth_mode.png'" << std::endl;
         if (show_timers) std::cout << "Mode method time: " << elapsed << " ms" << std::endl;
+    }
+    if (save_filled_depth_ip_basic) {
+        auto t_start = std::chrono::high_resolution_clock::now();
+        cuda_fill_depth_holes_ip_basic(d_depth, width, height, blob_iters);
+        cudaDeviceSynchronize();
+        auto t_end = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        std::vector<unsigned short> h_filled_depth(num_pixels);
+        cudaMemcpy(h_filled_depth.data(), d_depth, num_pixels * sizeof(unsigned short), cudaMemcpyDeviceToHost);
+        cv::Mat filled_depth_img(height, width, CV_16UC1, h_filled_depth.data());
+        cv::imwrite("filled_depth_ip_basic.png", filled_depth_img);
+        std::cout << "Saved filled depth image to 'filled_depth_ip_basic.png'" << std::endl;
+        if (show_timers) std::cout << "IP-Basic method time: " << elapsed << " ms" << std::endl;
     }
     auto t_hole_end = std::chrono::high_resolution_clock::now();
     auto t_filesave_end = std::chrono::high_resolution_clock::now();

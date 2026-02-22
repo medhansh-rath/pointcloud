@@ -288,11 +288,11 @@ extern "C" void cuda_fill_depth_holes_avg(
     cudaDeviceSynchronize();
 }
 
-// 6. CUDA Kernel for Blob-Based Hole Filling
+// 6. CUDA Kernel for Blob-Based Hole Filling (Fixed with two-buffer approach)
 __global__ void fillDepthBlobsKernel(
-    unsigned short* depth_map,
-    int width, int height,
-    int max_iters)
+    const unsigned short* __restrict__ depth_map_in,
+    unsigned short* __restrict__ depth_map_out,
+    int width, int height)
 {
     // Each thread processes one pixel
     int u = blockIdx.x * blockDim.x + threadIdx.x;
@@ -300,36 +300,37 @@ __global__ void fillDepthBlobsKernel(
     if (u >= width || v >= height) return;
     int idx = v * width + u;
 
-    // Temporary label image (1 = blob, 0 = not blob)
-    // For simplicity, use depth_map == 0 as blob
-    // This kernel assumes blobs are not overlapping and does not handle multiple blobs in parallel
+    // If pixel is already filled, just copy it
+    if (depth_map_in[idx] != 0) {
+        depth_map_out[idx] = depth_map_in[idx];
+        return;
+    }
 
-    // Iterative flood fill: propagate labels
-    for (int iter = 0; iter < max_iters; ++iter) {
-        if (depth_map[idx] != 0) continue;
-        // If any neighbor is labeled as filled, skip
-        bool is_boundary = false;
-        unsigned int sum = 0;
-        unsigned int count = 0;
-        for (int du = -1; du <= 1; ++du) {
-            for (int dv = -1; dv <= 1; ++dv) {
-                if (du == 0 && dv == 0) continue;
-                int nu = u + du;
-                int nv = v + dv;
-                if (nu < 0 || nu >= width || nv < 0 || nv >= height) continue;
-                int nidx = nv * width + nu;
-                unsigned short neighbor_depth = depth_map[nidx];
-                if (neighbor_depth != 0) {
-                    is_boundary = true;
-                    sum += neighbor_depth;
-                    count++;
-                }
+    // Pixel is a hole (0 value)
+    // Check 3x3 neighbors and fill with average of valid neighbors
+    unsigned int sum = 0;
+    unsigned int count = 0;
+    for (int du = -1; du <= 1; ++du) {
+        for (int dv = -1; dv <= 1; ++dv) {
+            if (du == 0 && dv == 0) continue;
+            int nu = u + du;
+            int nv = v + dv;
+            if (nu < 0 || nu >= width || nv < 0 || nv >= height) continue;
+            int nidx = nv * width + nu;
+            unsigned short neighbor_depth = depth_map_in[nidx];
+            if (neighbor_depth != 0) {
+                sum += neighbor_depth;
+                count++;
             }
         }
-        // If boundary, fill with average
-        if (is_boundary && count > 0) {
-            depth_map[idx] = sum / count;
-        }
+    }
+
+    // If at least one neighbor is valid, fill with average
+    if (count > 0) {
+        depth_map_out[idx] = sum / count;
+    } else {
+        // No valid neighbors yet, keep as hole
+        depth_map_out[idx] = 0;
     }
 }
 
@@ -338,10 +339,22 @@ extern "C" void cuda_fill_depth_blobs(
     int width, int height,
     int max_iters)
 {
+    // Allocate temporary buffer
+    unsigned short* d_temp;
+    cudaMalloc(&d_temp, width * height * sizeof(unsigned short));
+
     dim3 block(32, 32);
     dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
-    fillDepthBlobsKernel<<<grid, block>>>(d_depth, width, height, max_iters);
-    cudaDeviceSynchronize();
+
+    // Iterative propagation: each iteration fills one layer of holes from the boundary
+    for (int iter = 0; iter < max_iters; ++iter) {
+        fillDepthBlobsKernel<<<grid, block>>>(d_depth, d_temp, width, height);
+        cudaDeviceSynchronize();
+        // Copy temp back to depth for next iteration
+        cudaMemcpy(d_depth, d_temp, width * height * sizeof(unsigned short), cudaMemcpyDeviceToDevice);
+    }
+    
+    cudaFree(d_temp);
 }
 
 // 6b. CUDA Kernel for Jump Flooding Algorithm (JFA) Blob Filling
@@ -533,7 +546,106 @@ extern "C" void cuda_fill_depth_holes_mode(
     cudaDeviceSynchronize();
 }
 
+// 6e. CUDA Kernel for IP-Basic (In-Place Basic) Inpainting Algorithm
+// Uses confidence-based iterative propagation
+__global__ void fillDepthIPBasicKernel(
+    const unsigned short* __restrict__ depth_in,
+    const float* __restrict__ confidence_in,
+    unsigned short* __restrict__ depth_out,
+    float* __restrict__ confidence_out,
+    int width, int height)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+
+    // If already filled with high confidence, keep it
+    if (confidence_in[idx] > 0.9f) {
+        depth_out[idx] = depth_in[idx];
+        confidence_out[idx] = confidence_in[idx];
+        return;
+    }
+
+    // This is a hole or low-confidence pixel
+    // Collect neighbors and compute weighted average
+    float weighted_sum = 0.0f;
+    float total_weight = 0.0f;
+    float max_neighbor_confidence = 0.0f;
+
+    for (int du = -1; du <= 1; ++du) {
+        for (int dv = -1; dv <= 1; ++dv) {
+            if (du == 0 && dv == 0) continue;
+            int nu = u + du;
+            int nv = v + dv;
+            if (nu < 0 || nu >= width || nv < 0 || nv >= height) continue;
+            int nidx = nv * width + nu;
+            
+            float neighbor_conf = confidence_in[nidx];
+            if (neighbor_conf > 0.0f) {
+                // Weight by squared confidence (prioritize higher confidence)
+                float weight = neighbor_conf * neighbor_conf;
+                weighted_sum += depth_in[nidx] * weight;
+                total_weight += weight;
+                max_neighbor_confidence = fmaxf(max_neighbor_confidence, neighbor_conf);
+            }
+        }
+    }
+
+    if (total_weight > 0.0f) {
+        // Compute new depth as weighted average
+        depth_out[idx] = (unsigned short)(weighted_sum / total_weight + 0.5f);
+        // New confidence is reduced from max neighbor (penalty for inpainting)
+        confidence_out[idx] = max_neighbor_confidence * 0.99f;
+    } else {
+        // No valid neighbors yet
+        depth_out[idx] = depth_in[idx];
+        confidence_out[idx] = confidence_in[idx];
+    }
+}
+
+extern "C" void cuda_fill_depth_holes_ip_basic(
+    unsigned short* d_depth,
+    int width, int height,
+    int max_iters)
+{
+    // Allocate confidence map (1.0 = filled, 0.0 = unfilled)
+    float* d_confidence;
+    float* d_confidence_temp;
+    cudaMalloc(&d_confidence, width * height * sizeof(float));
+    cudaMalloc(&d_confidence_temp, width * height * sizeof(float));
+
+    // Allocate temporary depth buffer
+    unsigned short* d_depth_temp;
+    cudaMalloc(&d_depth_temp, width * height * sizeof(unsigned short));
+
+    dim3 block(32, 32);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+
+    // Initialize confidence to 0 (will build up from valid depth boundaries)
+    cudaMemset(d_confidence, 0, width * height * sizeof(float));
+    
+    // Iteratively fill holes
+    for (int iter = 0; iter < max_iters; ++iter) {
+        fillDepthIPBasicKernel<<<grid, block>>>(
+            d_depth, d_confidence,
+            d_depth_temp, d_confidence_temp,
+            width, height);
+        cudaDeviceSynchronize();
+
+        // Swap buffers
+        cudaMemcpy(d_depth, d_depth_temp, width * height * sizeof(unsigned short), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(d_confidence, d_confidence_temp, width * height * sizeof(float), cudaMemcpyDeviceToDevice);
+    }
+
+    cudaFree(d_confidence);
+    cudaFree(d_confidence_temp);
+    cudaFree(d_depth_temp);
+}
+
 // 7. The Wrapper Functions (Callable from C++)
+
 
 extern "C" void cuda_compute_cloud(
     const unsigned short* d_depth, 
