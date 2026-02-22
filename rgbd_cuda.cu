@@ -749,6 +749,468 @@ extern "C" void cuda_fill_depth_guided_filter(
     cudaFree(d_temp);
 }
 
+// 6g. CUDA Kernel for Maximum Filter (Morphological Dilation)
+// Takes the maximum valid depth value in a neighborhood
+__global__ void fillDepthMaxFilterKernel(
+    const unsigned short* __restrict__ depth_in,
+    unsigned short* __restrict__ depth_out,
+    int width, int height,
+    int filter_radius)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+
+    // If already filled, copy it
+    if (depth_in[idx] != 0) {
+        depth_out[idx] = depth_in[idx];
+        return;
+    }
+
+    // This is a hole, find the maximum valid depth in neighborhood
+    unsigned short max_depth = 0;
+
+    for (int du = -filter_radius; du <= filter_radius; ++du) {
+        for (int dv = -filter_radius; dv <= filter_radius; ++dv) {
+            int nu = u + du;
+            int nv = v + dv;
+            if (nu < 0 || nu >= width || nv < 0 || nv >= height) continue;
+            int nidx = nv * width + nu;
+
+            unsigned short neighbor_depth = depth_in[nidx];
+            if (neighbor_depth != 0) {
+                max_depth = max(max_depth, neighbor_depth);
+            }
+        }
+    }
+
+    depth_out[idx] = max_depth;
+}
+
+extern "C" void cuda_fill_depth_max_filter(
+    unsigned short* d_depth,
+    int width, int height,
+    int filter_radius,
+    int max_iters)
+{
+    // Allocate temporary depth buffer
+    unsigned short* d_temp;
+    cudaMalloc(&d_temp, width * height * sizeof(unsigned short));
+
+    dim3 block(32, 32);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+
+    // Iteratively fill holes
+    for (int iter = 0; iter < max_iters; ++iter) {
+        fillDepthMaxFilterKernel<<<grid, block>>>(
+            d_depth, d_temp, width, height, filter_radius);
+        cudaDeviceSynchronize();
+        
+        // Copy temp back to depth for next iteration
+        cudaMemcpy(d_depth, d_temp, width * height * sizeof(unsigned short), cudaMemcpyDeviceToDevice);
+    }
+
+    cudaFree(d_temp);
+}
+
+// 6h. CUDA Kernels for True Guided Filter (He & Sun, 2015)
+__global__ void rgbToGuidanceKernel(
+    const unsigned char* __restrict__ rgb,
+    float* __restrict__ guidance,
+    int width, int height)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+    int rgb_idx = idx * 3;
+
+    float r = rgb[rgb_idx] / 255.0f;
+    float g = rgb[rgb_idx + 1] / 255.0f;
+    float b = rgb[rgb_idx + 2] / 255.0f;
+    guidance[idx] = 0.299f * r + 0.587f * g + 0.114f * b;
+}
+
+__global__ void depthToFloatKernel(
+    const unsigned short* __restrict__ depth_in,
+    float* __restrict__ depth_out,
+    int width, int height)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+    depth_out[idx] = (float)depth_in[idx];
+}
+
+__global__ void maskFromDepthKernel(
+    const unsigned short* __restrict__ depth_in,
+    float* __restrict__ mask,
+    int width, int height)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+    mask[idx] = (depth_in[idx] != 0) ? 1.0f : 0.0f;
+}
+
+__global__ void multiplyKernel(
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int width, int height)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+    out[idx] = a[idx] * b[idx];
+}
+
+__global__ void rowPrefixSumKernel(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int width, int height)
+{
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= height) return;
+    int row = v * width;
+    float sum = 0.0f;
+    for (int u = 0; u < width; ++u) {
+        sum += in[row + u];
+        out[row + u] = sum;
+    }
+}
+
+__global__ void colPrefixSumInPlaceKernel(
+    float* __restrict__ inout,
+    int width, int height)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= width) return;
+    float sum = 0.0f;
+    for (int v = 0; v < height; ++v) {
+        int idx = v * width + u;
+        sum += inout[idx];
+        inout[idx] = sum;
+    }
+}
+
+__device__ inline float readIntegral(
+    const float* __restrict__ integral,
+    int x, int y,
+    int width, int height)
+{
+    if (x < 0 || y < 0 || x >= width || y >= height) return 0.0f;
+    return integral[y * width + x];
+}
+
+__global__ void boxSumFromIntegralKernel(
+    const float* __restrict__ integral,
+    float* __restrict__ out,
+    int width, int height,
+    int radius)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+
+    int x0 = u - radius;
+    int y0 = v - radius;
+    int x1 = u + radius;
+    int y1 = v + radius;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= width) x1 = width - 1;
+    if (y1 >= height) y1 = height - 1;
+
+    float A = readIntegral(integral, x0 - 1, y0 - 1, width, height);
+    float B = readIntegral(integral, x1, y0 - 1, width, height);
+    float C = readIntegral(integral, x0 - 1, y1, width, height);
+    float D = readIntegral(integral, x1, y1, width, height);
+
+    out[idx] = D - B - C + A;
+}
+
+__global__ void computeMaskedMeansKernel(
+    const float* __restrict__ sum_M,
+    const float* __restrict__ sum_I,
+    const float* __restrict__ sum_p,
+    const float* __restrict__ sum_I2,
+    const float* __restrict__ sum_Ip,
+    float* __restrict__ mean_I,
+    float* __restrict__ mean_p,
+    float* __restrict__ mean_I2,
+    float* __restrict__ mean_Ip,
+    int width, int height)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+
+    float denom = sum_M[idx];
+    if (denom > 1e-6f) {
+        float inv = 1.0f / denom;
+        mean_I[idx] = sum_I[idx] * inv;
+        mean_p[idx] = sum_p[idx] * inv;
+        mean_I2[idx] = sum_I2[idx] * inv;
+        mean_Ip[idx] = sum_Ip[idx] * inv;
+    } else {
+        mean_I[idx] = 0.0f;
+        mean_p[idx] = 0.0f;
+        mean_I2[idx] = 0.0f;
+        mean_Ip[idx] = 0.0f;
+    }
+}
+
+__global__ void computeMeanFromSumKernel(
+    const float* __restrict__ sum,
+    const float* __restrict__ sum_M,
+    float* __restrict__ mean,
+    int width, int height)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+
+    float denom = sum_M[idx];
+    if (denom > 1e-6f) {
+        mean[idx] = sum[idx] / denom;
+    } else {
+        mean[idx] = 0.0f;
+    }
+}
+
+__global__ void computeABKernel(
+    const float* __restrict__ mean_I,
+    const float* __restrict__ mean_p,
+    const float* __restrict__ mean_I2,
+    const float* __restrict__ mean_Ip,
+    float* __restrict__ a,
+    float* __restrict__ b,
+    int width, int height,
+    float eps)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+
+    float var_I = mean_I2[idx] - mean_I[idx] * mean_I[idx];
+    float cov_Ip = mean_Ip[idx] - mean_I[idx] * mean_p[idx];
+    float denom = var_I + eps;
+
+    a[idx] = (denom > 0.0f) ? (cov_Ip / denom) : 0.0f;
+    b[idx] = mean_p[idx] - a[idx] * mean_I[idx];
+}
+
+__global__ void computeQKernel(
+    const float* __restrict__ guidance,
+    const float* __restrict__ mean_a,
+    const float* __restrict__ mean_b,
+    float* __restrict__ q,
+    int width, int height)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+    q[idx] = mean_a[idx] * guidance[idx] + mean_b[idx];
+}
+
+__global__ void applyGuidedKernel(
+    const unsigned short* __restrict__ depth_in,
+    const float* __restrict__ q,
+    unsigned short* __restrict__ depth_out,
+    int width, int height)
+{
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= width || v >= height) return;
+    int idx = v * width + u;
+
+    if (depth_in[idx] != 0) {
+        depth_out[idx] = depth_in[idx];
+        return;
+    }
+
+    float val = q[idx];
+    if (val <= 0.0f) {
+        depth_out[idx] = 0;
+        return;
+    }
+
+    float clamped = fminf(val, 65535.0f);
+    depth_out[idx] = (unsigned short)(clamped + 0.5f);
+}
+
+static void boxFilterSum(
+    const float* d_in,
+    float* d_out,
+    float* d_temp,
+    int width, int height,
+    int radius)
+{
+    dim3 block_row(256, 1);
+    dim3 grid_row((height + block_row.x - 1) / block_row.x, 1);
+    dim3 block_col(256, 1);
+    dim3 grid_col((width + block_col.x - 1) / block_col.x, 1);
+    dim3 block(32, 32);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+
+    rowPrefixSumKernel<<<grid_row, block_row>>>(d_in, d_temp, width, height);
+    cudaDeviceSynchronize();
+    colPrefixSumInPlaceKernel<<<grid_col, block_col>>>(d_temp, width, height);
+    cudaDeviceSynchronize();
+    boxSumFromIntegralKernel<<<grid, block>>>(d_temp, d_out, width, height, radius);
+    cudaDeviceSynchronize();
+}
+
+extern "C" void cuda_fill_depth_true_guided(
+    unsigned short* d_depth,
+    const unsigned char* d_rgb,
+    int width, int height,
+    int radius,
+    float eps)
+{
+    size_t num_pixels = (size_t)width * (size_t)height;
+
+    float* d_I = nullptr;
+    float* d_p = nullptr;
+    float* d_M = nullptr;
+    float* d_I2 = nullptr;
+    float* d_Ip = nullptr;
+    float* d_I_M = nullptr;
+    float* d_p_M = nullptr;
+    float* d_I2_M = nullptr;
+    float* d_Ip_M = nullptr;
+    float* d_sum_M = nullptr;
+    float* d_sum_I = nullptr;
+    float* d_sum_p = nullptr;
+    float* d_sum_I2 = nullptr;
+    float* d_sum_Ip = nullptr;
+    float* d_mean_I = nullptr;
+    float* d_mean_p = nullptr;
+    float* d_mean_I2 = nullptr;
+    float* d_mean_Ip = nullptr;
+    float* d_a = nullptr;
+    float* d_b = nullptr;
+    float* d_a_M = nullptr;
+    float* d_b_M = nullptr;
+    float* d_sum_a = nullptr;
+    float* d_sum_b = nullptr;
+    float* d_mean_a = nullptr;
+    float* d_mean_b = nullptr;
+    float* d_q = nullptr;
+    float* d_temp = nullptr;
+    unsigned short* d_depth_out = nullptr;
+
+    cudaMalloc(&d_I, num_pixels * sizeof(float));
+    cudaMalloc(&d_p, num_pixels * sizeof(float));
+    cudaMalloc(&d_M, num_pixels * sizeof(float));
+    cudaMalloc(&d_I2, num_pixels * sizeof(float));
+    cudaMalloc(&d_Ip, num_pixels * sizeof(float));
+    cudaMalloc(&d_I_M, num_pixels * sizeof(float));
+    cudaMalloc(&d_p_M, num_pixels * sizeof(float));
+    cudaMalloc(&d_I2_M, num_pixels * sizeof(float));
+    cudaMalloc(&d_Ip_M, num_pixels * sizeof(float));
+    cudaMalloc(&d_sum_M, num_pixels * sizeof(float));
+    cudaMalloc(&d_sum_I, num_pixels * sizeof(float));
+    cudaMalloc(&d_sum_p, num_pixels * sizeof(float));
+    cudaMalloc(&d_sum_I2, num_pixels * sizeof(float));
+    cudaMalloc(&d_sum_Ip, num_pixels * sizeof(float));
+    cudaMalloc(&d_mean_I, num_pixels * sizeof(float));
+    cudaMalloc(&d_mean_p, num_pixels * sizeof(float));
+    cudaMalloc(&d_mean_I2, num_pixels * sizeof(float));
+    cudaMalloc(&d_mean_Ip, num_pixels * sizeof(float));
+    cudaMalloc(&d_a, num_pixels * sizeof(float));
+    cudaMalloc(&d_b, num_pixels * sizeof(float));
+    cudaMalloc(&d_a_M, num_pixels * sizeof(float));
+    cudaMalloc(&d_b_M, num_pixels * sizeof(float));
+    cudaMalloc(&d_sum_a, num_pixels * sizeof(float));
+    cudaMalloc(&d_sum_b, num_pixels * sizeof(float));
+    cudaMalloc(&d_mean_a, num_pixels * sizeof(float));
+    cudaMalloc(&d_mean_b, num_pixels * sizeof(float));
+    cudaMalloc(&d_q, num_pixels * sizeof(float));
+    cudaMalloc(&d_temp, num_pixels * sizeof(float));
+    cudaMalloc(&d_depth_out, num_pixels * sizeof(unsigned short));
+
+    dim3 block(32, 32);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+
+    rgbToGuidanceKernel<<<grid, block>>>(d_rgb, d_I, width, height);
+    depthToFloatKernel<<<grid, block>>>(d_depth, d_p, width, height);
+    maskFromDepthKernel<<<grid, block>>>(d_depth, d_M, width, height);
+    multiplyKernel<<<grid, block>>>(d_I, d_I, d_I2, width, height);
+    multiplyKernel<<<grid, block>>>(d_I, d_p, d_Ip, width, height);
+    multiplyKernel<<<grid, block>>>(d_I, d_M, d_I_M, width, height);
+    multiplyKernel<<<grid, block>>>(d_p, d_M, d_p_M, width, height);
+    multiplyKernel<<<grid, block>>>(d_I2, d_M, d_I2_M, width, height);
+    multiplyKernel<<<grid, block>>>(d_Ip, d_M, d_Ip_M, width, height);
+
+    boxFilterSum(d_M, d_sum_M, d_temp, width, height, radius);
+    boxFilterSum(d_I_M, d_sum_I, d_temp, width, height, radius);
+    boxFilterSum(d_p_M, d_sum_p, d_temp, width, height, radius);
+    boxFilterSum(d_I2_M, d_sum_I2, d_temp, width, height, radius);
+    boxFilterSum(d_Ip_M, d_sum_Ip, d_temp, width, height, radius);
+
+    computeMaskedMeansKernel<<<grid, block>>>(
+        d_sum_M, d_sum_I, d_sum_p, d_sum_I2, d_sum_Ip,
+        d_mean_I, d_mean_p, d_mean_I2, d_mean_Ip, width, height);
+
+    computeABKernel<<<grid, block>>>(
+        d_mean_I, d_mean_p, d_mean_I2, d_mean_Ip,
+        d_a, d_b, width, height, eps);
+
+    multiplyKernel<<<grid, block>>>(d_a, d_M, d_a_M, width, height);
+    multiplyKernel<<<grid, block>>>(d_b, d_M, d_b_M, width, height);
+    boxFilterSum(d_a_M, d_sum_a, d_temp, width, height, radius);
+    boxFilterSum(d_b_M, d_sum_b, d_temp, width, height, radius);
+    computeMeanFromSumKernel<<<grid, block>>>(d_sum_a, d_sum_M, d_mean_a, width, height);
+    computeMeanFromSumKernel<<<grid, block>>>(d_sum_b, d_sum_M, d_mean_b, width, height);
+
+    computeQKernel<<<grid, block>>>(d_I, d_mean_a, d_mean_b, d_q, width, height);
+    applyGuidedKernel<<<grid, block>>>(d_depth, d_q, d_depth_out, width, height);
+
+    cudaMemcpy(d_depth, d_depth_out, num_pixels * sizeof(unsigned short), cudaMemcpyDeviceToDevice);
+
+    cudaFree(d_I);
+    cudaFree(d_p);
+    cudaFree(d_M);
+    cudaFree(d_I2);
+    cudaFree(d_Ip);
+    cudaFree(d_I_M);
+    cudaFree(d_p_M);
+    cudaFree(d_I2_M);
+    cudaFree(d_Ip_M);
+    cudaFree(d_sum_M);
+    cudaFree(d_sum_I);
+    cudaFree(d_sum_p);
+    cudaFree(d_sum_I2);
+    cudaFree(d_sum_Ip);
+    cudaFree(d_mean_I);
+    cudaFree(d_mean_p);
+    cudaFree(d_mean_I2);
+    cudaFree(d_mean_Ip);
+    cudaFree(d_a);
+    cudaFree(d_b);
+    cudaFree(d_a_M);
+    cudaFree(d_b_M);
+    cudaFree(d_sum_a);
+    cudaFree(d_sum_b);
+    cudaFree(d_mean_a);
+    cudaFree(d_mean_b);
+    cudaFree(d_q);
+    cudaFree(d_temp);
+    cudaFree(d_depth_out);
+}
+
 // 7. The Wrapper Functions (Callable from C++)
 
 
