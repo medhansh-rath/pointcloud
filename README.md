@@ -60,7 +60,9 @@ Choose exactly one hole-filling algorithm:
 | Flag | Option | Description |
 |------|--------|-------------|
 | `-n` | Normalize | Normalize depth to [0, 255] for visualization |
-| `-v` | Visualize | Save visualization (PCD format for PCL viewer) |
+| `-p` | Save PCD | Save point cloud in PCL PCD format (ASCII text-based) |
+| `-B` | Save Binary | Save point cloud in compact binary format (.bin) |
+| `-v` | Visualize | Open PCL visualizer window to view 3D point cloud |
 | `-d` | Depth Overlay | Save RGB+Depth blended image (60% RGB, 40% depth with JET colormap) |
 | `-t` | Show Timers | Display per-method timing (ms) |
 
@@ -92,6 +94,18 @@ Choose exactly one hole-filling algorithm:
 ### Quick Preview (Fastest)
 ```bash
 ./fast_cloud rgb.jpg depth.png -s -n
+```
+
+### Save Point Cloud in Binary Format
+```bash
+# Save binary file (n×m×7 format: RGB + Depth + Normals)
+./fast_cloud rgb.jpg depth.png -G -B
+
+# With computed normals (otherwise normal channels will be zeros)
+./fast_cloud rgb.jpg depth.png -G -n -B
+
+# Save both binary and PCD formats
+./fast_cloud rgb.jpg depth.png -G -n -B -p
 ```
 
 ### High-Quality Edge-Preserving Fill
@@ -205,6 +219,75 @@ Creates `output_overlay.jpg`: RGB image composited with depth map using JET colo
 
 ```bash
 display output_overlay.jpg
+```
+
+### Binary Point Cloud Format (`-B` flag)
+Saves RGBD data in a compact binary format (`output.bin`) as an **n × m × 7 array**, preserving the 2D image structure. This format is much faster to read/write than PCD and doesn't require PCL as a dependency.
+
+**Binary Format Structure:**
+```
+Raw data (no header, row-major n×m×7 array of float32):
+  For each pixel (i,j) from (0,0) to (height-1, width-1):
+    - float r             (4 bytes) - Red channel (0-255)
+    - float g             (4 bytes) - Green channel (0-255)
+    - float b             (4 bytes) - Blue channel (0-255)
+    - float depth         (4 bytes) - Depth in mm or sensor units
+    - float normal_x      (4 bytes) - Normal X component (0 if -n not used)
+    - float normal_y      (4 bytes) - Normal Y component (0 if -n not used)
+    - float normal_z      (4 bytes) - Normal Z component (0 if -n not used)
+```
+
+**File Size:** `width × height × 7 × 4` bytes
+
+**Example:** 640×480 image → 2,150,400 bytes (~2.05 MB)
+
+**Notes:**
+- All 7 channels are always present; normal channels are zeros if `-n` flag not used
+- RGB values are in [0, 255] range (stored as float32)
+- Depth values preserve the original sensor units (typically millimeters)
+- Data is stored in **row-major order**: pixels are stored row by row, left to right
+- **No header** - dimensions must be known from context (specified when loading)
+
+**Loading Example (Python with NumPy):**
+```python
+import numpy as np
+
+# Direct load and reshape (you must know dimensions)
+data = np.fromfile('output.bin', dtype=np.float32).reshape(480, 640, 7)
+
+# Extract channels
+rgb = data[:, :, 0:3]      # Shape: (480, 640, 3), range [0, 255]
+depth = data[:, :, 3]      # Shape: (480, 640), in mm
+normals = data[:, :, 4:7]  # Shape: (480, 640, 3)
+
+print(f"RGB range: [{rgb.min():.0f}, {rgb.max():.0f}]")
+print(f"Depth range: [{depth.min():.1f}, {depth.max():.1f}] mm")
+
+# Alternative: infer dimensions from file size
+import os
+file_size = os.path.getsize('output.bin')
+num_floats = file_size // 4
+num_pixels = num_floats // 7
+# Note: You'll need to know aspect ratio or one dimension
+```
+
+**Loading Example (C++):**
+```cpp
+#include <fstream>
+#include <vector>
+
+// Load raw n×m×7 binary data
+std::vector<float> load_rgbd_binary(const std::string& filename, int width, int height) {
+    std::ifstream file(filename, std::ios::binary);
+    std::vector<float> data(width * height * 7);
+    file.read(reinterpret_cast<char*>(data.data()), data.size() * sizeof(float));
+    return data;
+}
+
+// Access pixel (i, j) channel c
+float get_channel(const std::vector<float>& data, int width, int i, int j, int c) {
+    return data[(i * width + j) * 7 + c];
+}
 ```
 
 ## Performance Benchmarks
