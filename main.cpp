@@ -103,6 +103,7 @@ int main(int argc, char** argv) {
         std::cerr << "  -v   Visualize result" << std::endl;
         std::cerr << "  -p   Save PCD point cloud" << std::endl;
         std::cerr << "  -B   Save binary point cloud (.bin)" << std::endl;
+        std::cerr << "  -L   Save binary as CIELAB instead of RGB" << std::endl;
         std::cerr << "  -t   Show timing information" << std::endl;
         std::cerr << "  -s   Save filled depth image (nearest)" << std::endl;
         std::cerr << "  -a   Save filled depth image (average)" << std::endl;
@@ -131,6 +132,7 @@ int main(int argc, char** argv) {
     bool visualize = false;
     bool save_pcd = false;
     bool save_binary = false;
+    bool save_binary_cielab = false;
     bool show_timers = false;
     bool save_filled_depth_nearest = false;
     bool save_filled_depth_avg = false;
@@ -156,6 +158,7 @@ int main(int argc, char** argv) {
         if (arg == "-v" || arg == "--viz") visualize = true;
         if (arg == "-p" || arg == "--save-pcd") save_pcd = true;
         if (arg == "-B" || arg == "--save-binary") save_binary = true;
+        if (arg == "-L" || arg == "--save-cielab") save_binary_cielab = true;
         if (arg == "-t" || arg == "--timers") show_timers = true;
         if (arg == "-s" || arg == "--save-depth") save_filled_depth_nearest = true;
         if (arg == "-a" || arg == "--save-depth-avg") save_filled_depth_avg = true;
@@ -496,27 +499,66 @@ int main(int argc, char** argv) {
         std::vector<unsigned short> h_filled_depth(num_pixels);
         cudaMemcpy(h_filled_depth.data(), d_depth, num_pixels * sizeof(unsigned short), cudaMemcpyDeviceToHost);
         
-        // Create n x m x 7 array: [r, g, b, depth, nx, ny, nz]
+        // Create n x m x 7 array: [r, g, b (or L, a, b if CIELAB), depth, nx, ny, nz]
         std::vector<float> image_data(num_pixels * 7);
         
-        for (size_t i = 0; i < num_pixels; ++i) {
-            // RGB (0-255 range)
-            image_data[i * 7 + 0] = static_cast<float>(h_points[i].r);
-            image_data[i * 7 + 1] = static_cast<float>(h_points[i].g);
-            image_data[i * 7 + 2] = static_cast<float>(h_points[i].b);
+        // If CIELAB conversion is requested, prepare LAB data
+        std::vector<uint8_t> lab_data;
+        if (save_binary_cielab) {
+            // Create an 8-bit BGR image from the RGB data
+            cv::Mat rgb_mat(height, width, CV_8UC3);
+            for (size_t i = 0; i < num_pixels; ++i) {
+                rgb_mat.data[i * 3 + 0] = h_points[i].r;      // R channel
+                rgb_mat.data[i * 3 + 1] = h_points[i].g;      // G channel
+                rgb_mat.data[i * 3 + 2] = h_points[i].b;      // B channel
+            }
             
-            // Depth (in mm or original units)
-            image_data[i * 7 + 3] = static_cast<float>(h_filled_depth[i]);
+            // Convert RGB to LAB
+            cv::Mat lab_mat;
+            cv::cvtColor(rgb_mat, lab_mat, cv::COLOR_RGB2Lab);
             
-            // Normals (0 if not computed)
-            if (use_normals && i < h_normals.size()) {
-                image_data[i * 7 + 4] = h_normals[i].x;
-                image_data[i * 7 + 5] = h_normals[i].y;
-                image_data[i * 7 + 6] = h_normals[i].z;
-            } else {
-                image_data[i * 7 + 4] = 0.0f;
-                image_data[i * 7 + 5] = 0.0f;
-                image_data[i * 7 + 6] = 0.0f;
+            // Extract LAB data
+            for (size_t i = 0; i < num_pixels; ++i) {
+                // OpenCV LAB: L [0-255], a [0-255], b [0-255]
+                image_data[i * 7 + 0] = static_cast<float>(lab_mat.data[i * 3 + 0]);  // L
+                image_data[i * 7 + 1] = static_cast<float>(lab_mat.data[i * 3 + 1]);  // a
+                image_data[i * 7 + 2] = static_cast<float>(lab_mat.data[i * 3 + 2]);  // b
+                
+                // Depth (in mm or original units)
+                image_data[i * 7 + 3] = static_cast<float>(h_filled_depth[i]);
+                
+                // Normals (0 if not computed)
+                if (use_normals && i < h_normals.size()) {
+                    image_data[i * 7 + 4] = h_normals[i].x;
+                    image_data[i * 7 + 5] = h_normals[i].y;
+                    image_data[i * 7 + 6] = h_normals[i].z;
+                } else {
+                    image_data[i * 7 + 4] = 0.0f;
+                    image_data[i * 7 + 5] = 0.0f;
+                    image_data[i * 7 + 6] = 0.0f;
+                }
+            }
+        } else {
+            // Use RGB as-is
+            for (size_t i = 0; i < num_pixels; ++i) {
+                // RGB (0-255 range)
+                image_data[i * 7 + 0] = static_cast<float>(h_points[i].r);
+                image_data[i * 7 + 1] = static_cast<float>(h_points[i].g);
+                image_data[i * 7 + 2] = static_cast<float>(h_points[i].b);
+                
+                // Depth (in mm or original units)
+                image_data[i * 7 + 3] = static_cast<float>(h_filled_depth[i]);
+                
+                // Normals (0 if not computed)
+                if (use_normals && i < h_normals.size()) {
+                    image_data[i * 7 + 4] = h_normals[i].x;
+                    image_data[i * 7 + 5] = h_normals[i].y;
+                    image_data[i * 7 + 6] = h_normals[i].z;
+                } else {
+                    image_data[i * 7 + 4] = 0.0f;
+                    image_data[i * 7 + 5] = 0.0f;
+                    image_data[i * 7 + 6] = 0.0f;
+                }
             }
         }
         
@@ -527,7 +569,8 @@ int main(int argc, char** argv) {
                           image_data.size() * sizeof(float));
             
             bin_file.close();
-            std::cout << "Saved 'output.bin' (" << width << "x" << height << " x 7 channels: RGB + Depth + Normals)" << std::endl;
+            std::string color_format = save_binary_cielab ? "CIELAB" : "RGB";
+            std::cout << "Saved 'output.bin' (" << width << "x" << height << " x 7 channels: " << color_format << " + Depth + Normals)" << std::endl;
         } else {
             std::cerr << "Error: Could not open output.bin for writing" << std::endl;
         }

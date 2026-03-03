@@ -1035,17 +1035,17 @@ __global__ void applyGuidedKernel(
     if (u >= width || v >= height) return;
     int idx = v * width + u;
 
-    if (depth_in[idx] != 0) {
+    // Apply guided filter to ALL pixels (not just holes)
+    // This enables denoising of existing depth values in addition to hole filling
+    float val = q[idx];
+    
+    // If filtered result is invalid or negative, keep original (if non-zero) or zero
+    if (val <= 0.0f) {
         depth_out[idx] = depth_in[idx];
         return;
     }
 
-    float val = q[idx];
-    if (val <= 0.0f) {
-        depth_out[idx] = 0;
-        return;
-    }
-
+    // Clamp and convert to unsigned short
     float clamped = fminf(val, 65535.0f);
     depth_out[idx] = (unsigned short)(clamped + 0.5f);
 }

@@ -196,9 +196,10 @@ Implements He & Sun (2015) guided filter with true-guided covariance propagation
 - Strongest edge preservation (respects RGB gradients)
 - Fast integral-image implementation (~2–3 ms for HD)
 - Properly handles depth holes via masked statistics
+- **Applies to ALL pixels** - denoises existing depth values in addition to filling holes
 - Theoretically principled (guidance-based covariance)
 
-**Best for:** High-quality results on textured scenes; recommended default for most applications.
+**Best for:** High-quality results on textured scenes; recommended default for most applications. Excellent for cleaning up noisy depth sensors while preserving edges.
 
 ### Morphological Maximum (`-x`)
 Dilation: expands valid regions outward, fills holes from boundaries inward.
@@ -348,6 +349,8 @@ All timings include GPU kernel execution and memory transfer. Actual throughput 
   - Low (5–20): Preserve sharp RGB edges even in depth
   - High (40–100): Aggressive smoothing across colors
 - **`true_guided_eps`**: Regularization (stability). Smaller (0.001–0.01) → tighter guidance; larger (0.05–0.1) → smoother.
+
+**Note on True Guided Filter (`-G`):** This filter applies to **all pixels**, not just holes. It will denoise/smooth existing depth measurements that may contain sensor noise or errors, while still filling holes. This makes it excellent for cleaning up noisy depth data while preserving edges.
 
 ## Troubleshooting
 
