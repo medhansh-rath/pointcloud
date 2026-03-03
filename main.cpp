@@ -129,6 +129,7 @@ int main(int argc, char** argv) {
         std::cerr << "  --guided-sigma <s>   Set guided filter color sigma (default 30.0)" << std::endl;
         std::cerr << "  --true-guided-radius <r>   Set true guided filter radius (default auto with -G, 0=auto-detect)" << std::endl;
         std::cerr << "  --true-guided-eps <e>   Set true guided filter eps (default 1e-3)" << std::endl;
+        std::cerr << "  --output <file>   Set output binary file path (default: output.bin)" << std::endl;
         return -1;
     }
 
@@ -161,6 +162,7 @@ int main(int argc, char** argv) {
     float true_guided_eps = 1e-3f;
     bool auto_radius = false;
     bool true_guided_radius_set = false;
+    std::string output_filename = "output.bin";
 
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
@@ -209,6 +211,9 @@ int main(int argc, char** argv) {
 
         if (arg == "--true-guided-eps" && i + 1 < argc) {
             true_guided_eps = std::stof(argv[++i]);
+        }
+        if (arg == "--output" && i + 1 < argc) {
+            output_filename = argv[++i];
         }
     }
 
@@ -623,7 +628,7 @@ int main(int argc, char** argv) {
             }
         }
         
-        std::ofstream bin_file("output.bin", std::ios::binary);
+        std::ofstream bin_file(output_filename, std::ios::binary);
         if (bin_file.is_open()) {
             // Write raw n x m x 7 data (no header for direct numpy loading)
             bin_file.write(reinterpret_cast<const char*>(image_data.data()), 
@@ -631,9 +636,9 @@ int main(int argc, char** argv) {
             
             bin_file.close();
             std::string color_format = save_binary_cielab ? "CIELAB" : "RGB";
-            std::cout << "Saved 'output.bin' (" << width << "x" << height << " x 7 channels: " << color_format << " + Depth + Normals)" << std::endl;
+            std::cout << "Saved '" << output_filename << "' (" << width << "x" << height << " x 7 channels: " << color_format << " + Depth + Normals)" << std::endl;
         } else {
-            std::cerr << "Error: Could not open output.bin for writing" << std::endl;
+            std::cerr << "Error: Could not open " << output_filename << " for writing" << std::endl;
         }
     }
     
