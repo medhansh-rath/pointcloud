@@ -85,7 +85,7 @@ Choose exactly one hole-filling algorithm:
 | `--blob_iters` | 5 | 1–20 | Iterations for blob propagation (-b) |
 | `--guided_filter_radius` | 4 | 1–12 | Window radius for bilateral filter (-g) |
 | `--guided_color_sigma` | 25 | 5–100 | Color similarity threshold for bilateral (-g, -G) |
-| `--true_guided_radius` | 4 | 1–12 | Filter radius for true guided filter (-G) |
+| `--true_guided_radius` | 4 | 0 (auto), 1–64 | Filter radius for true guided filter (-G); 0=auto-detect from largest interior hole |
 | `--true_guided_eps` | 0.01 | 0.001–0.1 | Regularization for guided filter (-G) |
 | `--max_filter_radius` | 2 | 1–8 | Dilation radius for maximum filter (-x) |
 
@@ -110,10 +110,17 @@ Choose exactly one hole-filling algorithm:
 
 ### High-Quality Edge-Preserving Fill
 ```bash
+# Auto-detect radius from largest interior hole (GPU-accelerated, ignores edge artifacts)
 ./fast_cloud rgb.jpg depth.png -G -n -d \
-  --true_guided_radius 6 \
-  --guided_color_sigma 30 \
-  --true_guided_eps 0.01
+  --true-guided-radius 0 \
+  --guided-color-sigma 30 \
+  --true-guided-eps 0.01
+
+# Manual radius control (for fine-tuning)
+./fast_cloud rgb.jpg depth.png -G -n -d \
+  --true-guided-radius 6 \
+  --guided-color-sigma 30 \
+  --true-guided-eps 0.01
 ```
 
 ### Very High Smoothing + Gap Filling (Recommended)

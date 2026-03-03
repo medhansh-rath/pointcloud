@@ -1028,15 +1028,19 @@ __global__ void applyGuidedKernel(
     const unsigned short* __restrict__ depth_in,
     const float* __restrict__ q,
     unsigned short* __restrict__ depth_out,
-    int width, int height)
+    int width, int height,
+    int apply_all_pixels)
 {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
     int v = blockIdx.y * blockDim.y + threadIdx.y;
     if (u >= width || v >= height) return;
     int idx = v * width + u;
 
-    // Apply guided filter to ALL pixels (not just holes)
-    // This enables denoising of existing depth values in addition to hole filling
+    if (!apply_all_pixels && depth_in[idx] != 0) {
+        depth_out[idx] = depth_in[idx];
+        return;
+    }
+
     float val = q[idx];
     
     // If filtered result is invalid or negative, keep original (if non-zero) or zero
@@ -1077,7 +1081,8 @@ extern "C" void cuda_fill_depth_true_guided(
     const unsigned char* d_rgb,
     int width, int height,
     int radius,
-    float eps)
+    float eps,
+    bool apply_all_pixels)
 {
     size_t num_pixels = (size_t)width * (size_t)height;
 
@@ -1176,7 +1181,7 @@ extern "C" void cuda_fill_depth_true_guided(
     computeMeanFromSumKernel<<<grid, block>>>(d_sum_b, d_sum_M, d_mean_b, width, height);
 
     computeQKernel<<<grid, block>>>(d_I, d_mean_a, d_mean_b, d_q, width, height);
-    applyGuidedKernel<<<grid, block>>>(d_depth, d_q, d_depth_out, width, height);
+    applyGuidedKernel<<<grid, block>>>(d_depth, d_q, d_depth_out, width, height, apply_all_pixels ? 1 : 0);
 
     cudaMemcpy(d_depth, d_depth_out, num_pixels * sizeof(unsigned short), cudaMemcpyDeviceToDevice);
 
@@ -1253,5 +1258,187 @@ extern "C" void cuda_reproject_to_image(
 
     reprojectToImageKernel<<<grid, block>>>(d_cloud, d_normals, d_image, width, height);
 
+    cudaDeviceSynchronize();
+}
+
+// ============================================================================
+// CUDA Blob Detection for Auto-Radius
+// ============================================================================
+
+// Init labels: each zero pixel gets unique label, non-zero gets -1
+__global__ void initLabelsKernel(const unsigned short* depth, int* labels, int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    
+    int idx = y * width + x;
+    labels[idx] = (depth[idx] == 0) ? idx : -1;
+}
+
+// Label propagation: each pixel takes minimum label from 4-neighbors
+__global__ void propagateLabelsKernel(const unsigned short* depth, int* labels, int* changed, int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    
+    int idx = y * width + x;
+    if (depth[idx] != 0) return; // Only process zero pixels
+    
+    int current_label = labels[idx];
+    int min_label = current_label;
+    
+    // Check 4-connected neighbors
+    if (x > 0 && labels[idx - 1] >= 0) min_label = min(min_label, labels[idx - 1]);
+    if (x < width - 1 && labels[idx + 1] >= 0) min_label = min(min_label, labels[idx + 1]);
+    if (y > 0 && labels[idx - width] >= 0) min_label = min(min_label, labels[idx - width]);
+    if (y < height - 1 && labels[idx + width] >= 0) min_label = min(min_label, labels[idx + width]);
+    
+    if (min_label < current_label) {
+        labels[idx] = min_label;
+        *changed = 1;
+    }
+}
+
+// Compute blob bounding boxes and mark edge-touching blobs
+__global__ void computeBlobStatsKernel(const int* labels, int* blob_min_x, int* blob_max_x, 
+                                        int* blob_min_y, int* blob_max_y, int* blob_size,
+                                        char* touches_edge, int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    
+    int idx = y * width + x;
+    int label = labels[idx];
+    if (label < 0) return;
+    
+    // Atomically update bounding box
+    atomicMin(&blob_min_x[label], x);
+    atomicMax(&blob_max_x[label], x);
+    atomicMin(&blob_min_y[label], y);
+    atomicMax(&blob_max_y[label], y);
+    atomicAdd(&blob_size[label], 1);
+    
+    // Check if on edge (1 pixel from border)
+    if (x <= 0 || x >= width - 1 || y <= 0 || y >= height - 1) {
+        touches_edge[label] = 1;
+    }
+}
+
+extern "C" void cuda_find_largest_interior_blob(
+    const unsigned short* d_depth,
+    int width, int height,
+    int* max_dimension, int* blob_size, int* blob_width, int* blob_height)
+{
+    int num_pixels = width * height;
+    dim3 block(32, 32);
+    dim3 grid((width + 31) / 32, (height + 31) / 32);
+    
+    // Allocate device memory
+    int* d_labels;
+    int* d_blob_min_x;
+    int* d_blob_max_x;
+    int* d_blob_min_y;
+    int* d_blob_max_y;
+    int* d_blob_size;
+    char* d_touches_edge;
+    int* d_changed;
+    int* h_blob_min_x;
+    int* h_blob_max_x;
+    int* h_blob_min_y;
+    int* h_blob_max_y;
+    int* h_blob_size;
+    char* h_touches_edge;
+    
+    cudaMalloc(&d_labels, num_pixels * sizeof(int));
+    cudaMalloc(&d_blob_min_x, num_pixels * sizeof(int));
+    cudaMalloc(&d_blob_max_x, num_pixels * sizeof(int));
+    cudaMalloc(&d_blob_min_y, num_pixels * sizeof(int));
+    cudaMalloc(&d_blob_max_y, num_pixels * sizeof(int));
+    cudaMalloc(&d_blob_size, num_pixels * sizeof(int));
+    cudaMalloc(&d_touches_edge, num_pixels * sizeof(char));
+    cudaMalloc(&d_changed, sizeof(int));
+    h_blob_min_x = new int[num_pixels];
+    h_blob_max_x = new int[num_pixels];
+    h_blob_min_y = new int[num_pixels];
+    h_blob_max_y = new int[num_pixels];
+    h_blob_size = new int[num_pixels];
+    h_touches_edge = new char[num_pixels];
+    
+    // Initialize
+    cudaMemset(d_blob_min_x, 0x7f, num_pixels * sizeof(int)); // INT_MAX
+    cudaMemset(d_blob_max_x, 0, num_pixels * sizeof(int));
+    cudaMemset(d_blob_min_y, 0x7f, num_pixels * sizeof(int));
+    cudaMemset(d_blob_max_y, 0, num_pixels * sizeof(int));
+    cudaMemset(d_blob_size, 0, num_pixels * sizeof(int));
+    cudaMemset(d_touches_edge, 0, num_pixels * sizeof(char));
+    
+    // Step 1: Initialize labels
+    initLabelsKernel<<<grid, block>>>(d_depth, d_labels, width, height);
+    
+    // Step 2: Label propagation (iterate until convergence)
+    int h_changed = 1;
+    int max_iters = 1000; // Safety limit
+    for (int iter = 0; iter < max_iters && h_changed; iter++) {
+        h_changed = 0;
+        cudaMemcpy(d_changed, &h_changed, sizeof(int), cudaMemcpyHostToDevice);
+        propagateLabelsKernel<<<grid, block>>>(d_depth, d_labels, d_changed, width, height);
+        cudaMemcpy(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost);
+    }
+    
+    // Step 3: Compute blob statistics
+    computeBlobStatsKernel<<<grid, block>>>(d_labels, d_blob_min_x, d_blob_max_x, d_blob_min_y, d_blob_max_y,
+                                            d_blob_size, d_touches_edge, width, height);
+    
+    // Step 4: Copy stats back and select largest interior blob deterministically on host
+    cudaMemcpy(h_blob_min_x, d_blob_min_x, num_pixels * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_blob_max_x, d_blob_max_x, num_pixels * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_blob_min_y, d_blob_min_y, num_pixels * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_blob_max_y, d_blob_max_y, num_pixels * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_blob_size, d_blob_size, num_pixels * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_touches_edge, d_touches_edge, num_pixels * sizeof(char), cudaMemcpyDeviceToHost);
+
+    int best_max_dim = 0;
+    int best_blob_size = 0;
+    int best_width = 0;
+    int best_height = 0;
+
+    for (int i = 0; i < num_pixels; ++i) {
+        if (h_blob_size[i] <= 0 || h_touches_edge[i]) continue;
+
+        int bw = h_blob_max_x[i] - h_blob_min_x[i] + 1;
+        int bh = h_blob_max_y[i] - h_blob_min_y[i] + 1;
+        if (bw <= 0 || bh <= 0) continue;
+
+        int md = (bw > bh) ? bw : bh;
+
+        if (md > best_max_dim || (md == best_max_dim && h_blob_size[i] > best_blob_size)) {
+            best_max_dim = md;
+            best_blob_size = h_blob_size[i];
+            best_width = bw;
+            best_height = bh;
+        }
+    }
+
+    *max_dimension = best_max_dim;
+    *blob_size = best_blob_size;
+    *blob_width = best_width;
+    *blob_height = best_height;
+    
+    // Cleanup
+    cudaFree(d_labels);
+    cudaFree(d_blob_min_x);
+    cudaFree(d_blob_max_x);
+    cudaFree(d_blob_min_y);
+    cudaFree(d_blob_max_y);
+    cudaFree(d_blob_size);
+    cudaFree(d_touches_edge);
+    cudaFree(d_changed);
+    delete[] h_blob_min_x;
+    delete[] h_blob_max_x;
+    delete[] h_blob_min_y;
+    delete[] h_blob_max_y;
+    delete[] h_blob_size;
+    delete[] h_touches_edge;
+    
     cudaDeviceSynchronize();
 }

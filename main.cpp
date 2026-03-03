@@ -86,13 +86,19 @@ extern "C" void cuda_fill_depth_true_guided(
     const unsigned char* d_rgb,
     int width, int height,
     int radius,
-    float eps);
+    float eps,
+    bool apply_all_pixels);
 
 extern "C" void cuda_fill_depth_max_filter(
     unsigned short* d_depth,
     int width, int height,
     int filter_radius,
     int max_iters);
+
+extern "C" void cuda_find_largest_interior_blob(
+    const unsigned short* d_depth,
+    int width, int height,
+    int* max_dimension, int* blob_size, int* blob_width, int* blob_height);
 
 int main(int argc, char** argv) {
     auto process_start = std::chrono::high_resolution_clock::now();
@@ -113,14 +119,15 @@ int main(int argc, char** argv) {
         std::cerr << "  -o   Save filled depth image (mode)" << std::endl;
         std::cerr << "  -c   Save filled depth image (IP-Basic inpainting)" << std::endl;
         std::cerr << "  -g   Save filled depth image (Guided Filter)" << std::endl;
-        std::cerr << "  -G   Save filled depth image (True Guided Filter)" << std::endl;
+        std::cerr << "  -G   Save filled depth image (True Guided Filter, fills zeros only)" << std::endl;
+        std::cerr << "  -A   Apply true guided filter to all pixels (denoise + fill, use with -G)" << std::endl;
         std::cerr << "  -x   Save filled depth image (Maximum Filter)" << std::endl;
         std::cerr << "  -d   Save RGB+depth overlay image" << std::endl;
         std::cerr << "  --fill-radius <r>   Set max fill radius (default 10)" << std::endl;
         std::cerr << "  --blob-iters <i>   Set max blob iterations (default 10)" << std::endl;
         std::cerr << "  --guided-radius <r>   Set guided filter radius (default 2)" << std::endl;
         std::cerr << "  --guided-sigma <s>   Set guided filter color sigma (default 30.0)" << std::endl;
-        std::cerr << "  --true-guided-radius <r>   Set true guided filter radius (default 4)" << std::endl;
+        std::cerr << "  --true-guided-radius <r>   Set true guided filter radius (default auto with -G, 0=auto-detect)" << std::endl;
         std::cerr << "  --true-guided-eps <e>   Set true guided filter eps (default 1e-3)" << std::endl;
         return -1;
     }
@@ -143,14 +150,17 @@ int main(int argc, char** argv) {
     bool save_filled_depth_ip_basic = false;
     bool save_filled_depth_guided = false;
     bool save_filled_depth_true_guided = false;
+    bool true_guided_all_pixels = false;
     bool save_filled_depth_max = false;
     bool save_depth_overlay = false;
     int fill_radius = 10;
     int blob_iters = 10;
     int guided_filter_radius = 2;
     float guided_color_sigma = 30.0f;
-    int true_guided_radius = 4;
+    int true_guided_radius = 0;
     float true_guided_eps = 1e-3f;
+    bool auto_radius = false;
+    bool true_guided_radius_set = false;
 
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
@@ -169,6 +179,7 @@ int main(int argc, char** argv) {
         if (arg == "-c" || arg == "--save-depth-ip-basic") save_filled_depth_ip_basic = true;
         if (arg == "-g" || arg == "--save-depth-guided") save_filled_depth_guided = true;
         if (arg == "-G" || arg == "--save-depth-true-guided") save_filled_depth_true_guided = true;
+        if (arg == "-A" || arg == "--true-guided-all-pixels") true_guided_all_pixels = true;
         if (arg == "-x" || arg == "--save-depth-max") save_filled_depth_max = true;
         if (arg == "-d" || arg == "--save-depth-overlay") save_depth_overlay = true;
         if (arg == "--fill-radius" && i + 1 < argc) {
@@ -185,7 +196,17 @@ int main(int argc, char** argv) {
         }
         if (arg == "--true-guided-radius" && i + 1 < argc) {
             true_guided_radius = std::stoi(argv[++i]);
+            true_guided_radius_set = true;
+            if (true_guided_radius == 0) {
+                auto_radius = true;
+            } else {
+                auto_radius = false;
+            }
         }
+            if (save_filled_depth_true_guided && !true_guided_radius_set) {
+                auto_radius = true;
+            }
+
         if (arg == "--true-guided-eps" && i + 1 < argc) {
             true_guided_eps = std::stof(argv[++i]);
         }
@@ -208,6 +229,43 @@ int main(int argc, char** argv) {
     auto t_preproc_start = std::chrono::high_resolution_clock::now();
     if (depth_img.size() != rgb_img.size()) {
         cv::resize(depth_img, depth_img, rgb_img.size(), 0, 0, cv::INTER_NEAREST);
+    }
+
+    // Auto-detect radius based on largest interior blob (not touching edges) - CUDA accelerated
+    if (save_filled_depth_true_guided && (auto_radius || true_guided_radius == 0)) {
+        // Upload depth to GPU
+        unsigned short* d_depth_temp;
+        size_t depth_bytes = depth_img.rows * depth_img.cols * sizeof(unsigned short);
+        cudaMalloc(&d_depth_temp, depth_bytes);
+        cudaMemcpy(d_depth_temp, depth_img.data, depth_bytes, cudaMemcpyHostToDevice);
+        
+        // Call CUDA blob detection
+        int max_dimension = 0, largest_blob_size = 0, largest_blob_width = 0, largest_blob_height = 0;
+        cuda_find_largest_interior_blob(d_depth_temp, depth_img.cols, depth_img.rows,
+                                        &max_dimension, &largest_blob_size, 
+                                        &largest_blob_width, &largest_blob_height);
+        
+        cudaFree(d_depth_temp);
+        
+        // Set radius from the shorter blob side (better for long corridor-like holes)
+        if (largest_blob_size > 0) {
+            int min_dimension = std::min(largest_blob_width, largest_blob_height);
+            true_guided_radius = std::max(2, std::min(64, (min_dimension + 1) / 2));
+            
+            if (show_timers || auto_radius) {
+                std::cout << "Auto-detected true-guided-radius: " << true_guided_radius 
+                          << " (largest interior blob: " << largest_blob_size 
+                          << " pixels, " << largest_blob_width << "x" << largest_blob_height 
+                          << ", min side: " << min_dimension
+                          << ", max side: " << max_dimension << ")" << std::endl;
+            }
+        } else {
+            // Fallback: no interior blobs, use default
+            true_guided_radius = 4;
+            if (show_timers || auto_radius) {
+                std::cout << "No interior holes found, using default radius: " << true_guided_radius << std::endl;
+            }
+        }
     }
 
     cv::Mat rgb_conv;
@@ -392,7 +450,10 @@ int main(int argc, char** argv) {
     }
     if (save_filled_depth_true_guided) {
         auto t_start = std::chrono::high_resolution_clock::now();
-        cuda_fill_depth_true_guided(d_depth, d_rgb, width, height, true_guided_radius, true_guided_eps);
+        cuda_fill_depth_true_guided(
+            d_depth, d_rgb, width, height,
+            true_guided_radius, true_guided_eps,
+            true_guided_all_pixels);
         cudaDeviceSynchronize();
         auto t_end = std::chrono::high_resolution_clock::now();
         double elapsed = std::chrono::duration<double, std::milli>(t_end - t_start).count();
