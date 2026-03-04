@@ -4,9 +4,13 @@ cmake_minimum_required(VERSION 3.10)
 project(fast_cloud LANGUAGES C CXX CUDA)
 set(CMAKE_CUDA_ARCHITECTURES native)
 
+# Option to disable visualization (for headless servers)
+option(DISABLE_VISUALIZATION "Build without PCL visualization support" ON)
+
 # Find Dependencies
 find_package(MPI REQUIRED COMPONENTS C CXX)
-find_package(PCL REQUIRED)
+# Only require the PCL components we actually need (not visualization)
+find_package(PCL REQUIRED COMPONENTS common io features filters)
 find_package(OpenCV REQUIRED)  # <--- NEW: Find OpenCV
 
 # Includes
@@ -22,6 +26,11 @@ add_definitions(${PCL_DEFINITIONS})
 
 # Executable
 add_executable(fast_cloud main.cpp rgbd_cuda.cu)
+
+# Add compile definition if visualization is disabled
+if(DISABLE_VISUALIZATION)
+    target_compile_definitions(fast_cloud PRIVATE DISABLE_VISUALIZATION)
+endif()
 
 # Link Libraries
 target_link_libraries(fast_cloud 

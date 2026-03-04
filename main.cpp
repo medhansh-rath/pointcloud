@@ -8,7 +8,9 @@
 
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
+#ifndef DISABLE_VISUALIZATION
 #include <pcl/visualization/pcl_visualizer.h>
+#endif
 #include <pcl/io/pcd_io.h>
 #include <opencv2/opencv.hpp>
 
@@ -106,7 +108,9 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: " << argv[0] << " <rgb_image> <depth_image> [options]" << std::endl;
         std::cerr << "Options:" << std::endl;
         std::cerr << "  -n   Compute Surface Normals" << std::endl;
+#ifndef DISABLE_VISUALIZATION
         std::cerr << "  -v   Visualize result" << std::endl;
+#endif
         std::cerr << "  -p   Save PCD point cloud" << std::endl;
         std::cerr << "  -B   Save binary point cloud (.bin)" << std::endl;
         std::cerr << "  -L   Save binary as CIELAB instead of RGB" << std::endl;
@@ -167,7 +171,9 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-n" || arg == "--normals") use_normals = true;
+#ifndef DISABLE_VISUALIZATION
         if (arg == "-v" || arg == "--viz") visualize = true;
+#endif
         if (arg == "-p" || arg == "--save-pcd") save_pcd = true;
         if (arg == "-B" || arg == "--save-binary") save_binary = true;
         if (arg == "-L" || arg == "--save-cielab") save_binary_cielab = true;
@@ -646,6 +652,7 @@ int main(int argc, char** argv) {
     if (show_timers) std::cout << "PCL conversion & PCD save time: " << std::chrono::duration<double, std::milli>(t_pcl_end - t_pcl_start).count() << " ms" << std::endl;
 
     // 7. Visualization
+#ifndef DISABLE_VISUALIZATION
     if (visualize) {
         pcl::visualization::PCLVisualizer::Ptr viewer(new pcl::visualization::PCLVisualizer("3D Viewer"));
         viewer->setBackgroundColor(0.1, 0.1, 0.1);
@@ -668,6 +675,11 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
+#else
+    if (visualize) {
+        std::cerr << "Warning: Visualization disabled in this build (headless mode)" << std::endl;
+    }
+#endif
 
     // Cleanup (Async)
     auto t_cleanup_start = std::chrono::high_resolution_clock::now();
